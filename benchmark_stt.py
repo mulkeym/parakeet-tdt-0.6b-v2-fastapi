@@ -70,6 +70,26 @@ TEXT_POOL = [
 ]
 
 
+def parse_dmon_line(line: str) -> tuple[int, int] | None:
+    """Parse one line of nvidia-smi dmon output.
+
+    Expected columns (with -s um): gpu_idx, sm%, mem%, fb_used_MiB
+    Returns (gpu_util_pct, vram_used_mib) or None for headers/blanks.
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    parts = line.split()
+    if len(parts) < 4:
+        return None
+    try:
+        sm_pct = int(parts[1])
+        fb_mib = int(parts[3])
+        return (sm_pct, fb_mib)
+    except (ValueError, IndexError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
