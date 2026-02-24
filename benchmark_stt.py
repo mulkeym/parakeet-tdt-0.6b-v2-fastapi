@@ -6,7 +6,9 @@ import asyncio
 import csv
 import io
 import json
+import logging
 import statistics
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -15,6 +17,8 @@ import httpx
 import numpy as np
 import soundfile as sf
 import websockets
+
+logger = logging.getLogger("benchmark")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -88,6 +92,116 @@ def parse_dmon_line(line: str) -> tuple[int, int] | None:
         return (sm_pct, fb_mib)
     except (ValueError, IndexError):
         return None
+
+
+def compute_gpu_stats(samples: list[tuple[int, int]]) -> dict:
+    """Compute summary stats from a list of (gpu_util, vram_mib) samples."""
+    if not samples:
+        return {
+            "gpu_util_mean": None, "gpu_util_p95": None,
+            "vram_peak_mib": None, "vram_mean_mib": None,
+        }
+    utils = [s[0] for s in samples]
+    vrams = [s[1] for s in samples]
+    return {
+        "gpu_util_mean": round(statistics.mean(utils), 1),
+        "gpu_util_p95": round(percentile(utils, 95), 1),
+        "vram_peak_mib": max(vrams),
+        "vram_mean_mib": round(statistics.mean(vrams), 1),
+    }
+
+
+def detect_gpu_id() -> int:
+    """Find the GPU running a python process via nvidia-smi. Returns device index or 0."""
+    try:
+        apps = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        gpu_uuids = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,gpu_uuid", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        uuid_to_idx = {}
+        for line in gpu_uuids.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) == 2:
+                uuid_to_idx[parts[1]] = int(parts[0])
+
+        for line in apps.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) == 2:
+                pid_str, gpu_uuid = parts
+                try:
+                    cmd = subprocess.run(
+                        ["ps", "-p", pid_str, "-o", "comm="],
+                        capture_output=True, text=True, timeout=2,
+                    )
+                    if "python" in cmd.stdout.lower():
+                        idx = uuid_to_idx.get(gpu_uuid, 0)
+                        logger.info("Detected parakeet on GPU %d (PID %s)", idx, pid_str)
+                        return idx
+                except Exception:
+                    pass
+    except Exception as exc:
+        logger.warning("GPU auto-detect failed: %s", exc)
+    logger.warning("Could not detect GPU, defaulting to device 0")
+    return 0
+
+
+class GpuMonitor:
+    """Collects GPU utilization and VRAM samples via nvidia-smi dmon."""
+
+    def __init__(self, gpu_id: int):
+        self.gpu_id = gpu_id
+        self.samples: list[tuple[int, int]] = []  # (gpu_util%, vram_mib)
+        self._proc: subprocess.Popen | None = None
+        self._task: asyncio.Task | None = None
+
+    async def start(self):
+        """Start the dmon subprocess and reader task."""
+        try:
+            self._proc = subprocess.Popen(
+                ["nvidia-smi", "dmon", "-s", "um", "-d", "1", "-i", str(self.gpu_id)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            )
+            self._task = asyncio.create_task(self._reader())
+            logger.info("GPU monitor started on device %d", self.gpu_id)
+        except FileNotFoundError:
+            logger.warning("nvidia-smi not found, GPU metrics disabled")
+
+    async def _reader(self):
+        """Read dmon stdout in a thread and parse lines."""
+        loop = asyncio.get_event_loop()
+        while self._proc and self._proc.poll() is None:
+            line = await loop.run_in_executor(None, self._proc.stdout.readline)
+            if not line:
+                break
+            parsed = parse_dmon_line(line)
+            if parsed is not None:
+                self.samples.append(parsed)
+
+    def mark(self) -> int:
+        """Return current sample count as a snapshot marker."""
+        return len(self.samples)
+
+    def slice_stats(self, start_mark: int) -> dict:
+        """Compute stats for samples collected since start_mark."""
+        window = self.samples[start_mark:]
+        return compute_gpu_stats(window)
+
+    async def stop(self):
+        """Kill the dmon subprocess."""
+        if self._proc:
+            self._proc.terminate()
+            self._proc.wait(timeout=3)
+            self._proc = None
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
 
 
 # ---------------------------------------------------------------------------

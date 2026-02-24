@@ -34,3 +34,31 @@ class TestParseDmonLine:
         from benchmark_stt import parse_dmon_line
         result = parse_dmon_line("    0    0    0     0")
         assert result == (0, 0)
+
+
+class TestGpuStats:
+    """Test GPU stats computation from sample lists."""
+
+    def test_compute_gpu_stats_basic(self):
+        from benchmark_stt import compute_gpu_stats
+        # samples: list of (gpu_util, vram_mib)
+        samples = [(40, 1800), (50, 1900), (60, 2000), (80, 2200), (90, 2400)]
+        stats = compute_gpu_stats(samples)
+        assert stats["gpu_util_mean"] == 64.0
+        assert stats["gpu_util_p95"] >= 86.0  # between 80 and 90
+        assert stats["vram_peak_mib"] == 2400
+        assert stats["vram_mean_mib"] == 2060.0
+
+    def test_compute_gpu_stats_empty(self):
+        from benchmark_stt import compute_gpu_stats
+        stats = compute_gpu_stats([])
+        assert stats["gpu_util_mean"] is None
+        assert stats["vram_peak_mib"] is None
+
+    def test_compute_gpu_stats_single(self):
+        from benchmark_stt import compute_gpu_stats
+        stats = compute_gpu_stats([(75, 3000)])
+        assert stats["gpu_util_mean"] == 75.0
+        assert stats["gpu_util_p95"] == 75.0
+        assert stats["vram_peak_mib"] == 3000
+        assert stats["vram_mean_mib"] == 3000.0
