@@ -12,15 +12,20 @@ import statistics
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
 import numpy as np
 import soundfile as sf
 import websockets
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.text import Text
 
 logger = logging.getLogger("benchmark")
+console = Console()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -29,6 +34,7 @@ SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1600  # 100ms chunks at 16kHz (matches voice agent)
 FRAME_DURATION = FRAME_SAMPLES / SAMPLE_RATE  # 0.1 seconds
 SILENCE_PADDING_FRAMES = int(1.0 / FRAME_DURATION)  # ~10 frames of trailing silence
+POST_SEND_WAIT = 30.0  # max seconds to wait for results after all audio is sent
 
 # Pool of unique paragraphs -- each concurrent session gets a different one.
 # This catches cross-session result leaking or stale-data memory bugs.
@@ -241,6 +247,24 @@ class SessionResult:
     audio_duration: float   # duration of the audio clip (seconds)
     transcript: str         # concatenated transcription text
     reference: str          # the reference text this session was given
+    session_id: int = 0
+    cancelled: bool = False # True if the receiver was force-cancelled before completion
+    log_lines: list[str] = field(default_factory=list, repr=False)
+
+
+@dataclass
+class SessionState:
+    """Mutable shared state updated by run_session() in real-time for live display."""
+    session_id: int
+    status: str = "pending"       # pending/connecting/streaming/flushing/waiting/done/error
+    frames_sent: int = 0
+    total_frames: int = 0
+    msgs_received: int = 0
+    texts_received: int = 0
+    elapsed: float = 0.0
+    transcript_preview: str = ""
+    eos_latency: float | None = None
+    error: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +389,9 @@ async def run_session(
     sample: AudioSample,
     timeout: float,
     session_id: int,
+    verbose: bool = False,
+    post_wait: float = POST_SEND_WAIT,
+    state: SessionState | None = None,
 ) -> SessionResult:
     """Stream audio over the STT websocket and collect transcription results."""
 
@@ -382,58 +409,243 @@ async def run_session(
     silence_frame = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
     texts: list[str] = []
     last_text_time: float | None = None
-    sending_done = asyncio.Event()
+    session_start = time.monotonic()
+    log: list[str] = []  # buffered verbose output, printed sorted after all sessions
 
-    async with websockets.connect(stt_url, ping_interval=None, ping_timeout=None) as ws:
+    tag = f"[S{session_id:>02d}]"
 
-        async def receiver():
-            nonlocal last_text_time
+    if state:
+        state.total_frames = len(frames)
+        state.status = "connecting"
+
+    if verbose:
+        log.append(f"  {tag} connecting to {stt_url} ...")
+
+    try:
+        async with websockets.connect(stt_url, ping_interval=None, ping_timeout=None) as ws:
+
+            if verbose:
+                elapsed = time.monotonic() - session_start
+                log.append(f"  {tag} connected ({elapsed:.3f}s). "
+                           f"Sending {len(frames)} audio + {SILENCE_PADDING_FRAMES} silence frames")
+
+            if state:
+                state.status = "streaming"
+                state.elapsed = time.monotonic() - session_start
+
+            sending_done = asyncio.Event()
+
+            async def receiver():
+                nonlocal last_text_time
+                msg_count = 0
+                queued_count = 0
+                results_received = 0
+
+                def _all_results_in() -> bool:
+                    return (sending_done.is_set()
+                            and results_received >= queued_count > 0)
+
+                try:
+                    while True:
+                        # Race: either a ws message arrives or sending completes.
+                        # If all results arrived before sending_done, we need to
+                        # re-check once the event fires rather than blocking on
+                        # ws.recv() for the full timeout.
+                        recv_fut = asyncio.ensure_future(ws.recv())
+                        done_fut = asyncio.ensure_future(sending_done.wait())
+                        done, pending = await asyncio.wait(
+                            [recv_fut, done_fut],
+                            timeout=timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for fut in pending:
+                            fut.cancel()
+
+                        if not done:
+                            break  # timeout — same as old TimeoutError exit
+
+                        if recv_fut in done:
+                            raw = recv_fut.result()
+                            msg = json.loads(raw)
+                            msg_count += 1
+
+                            if state:
+                                state.msgs_received = msg_count
+                                state.elapsed = time.monotonic() - session_start
+
+                            if verbose:
+                                elapsed = time.monotonic() - session_start
+                                kind = "TEXT" if "text" in msg else "status"
+                                preview = msg.get("text", msg.get("status", ""))
+                                if isinstance(preview, str) and len(preview) > 80:
+                                    preview = preview[:80] + "..."
+                                log.append(f"  {tag} RECV #{msg_count} [{kind}] "
+                                           f"@ {elapsed:.3f}s: {preview}")
+
+                            if msg.get("status") == "queued":
+                                queued_count += 1
+
+                            if "text" in msg:
+                                results_received += 1
+                                if msg["text"].strip():
+                                    last_text_time = time.monotonic()
+                                    texts.append(msg["text"])
+                                    if state:
+                                        state.texts_received = len(texts)
+                                        state.transcript_preview = msg["text"].strip()[:60]
+
+                        # Check after processing a message OR after sending_done fires
+                        if _all_results_in():
+                            if verbose:
+                                elapsed = time.monotonic() - session_start
+                                log.append(
+                                    f"  {tag} all {results_received} result(s) "
+                                    f"received @ {elapsed:.3f}s — exiting early")
+                            break
+                except websockets.exceptions.ConnectionClosed:
+                    if verbose:
+                        log.append(f"  {tag} connection closed ({msg_count} msgs)")
+                except asyncio.CancelledError:
+                    pass  # normal exit — post-wait cap reached
+
+            recv_task = asyncio.create_task(receiver())
+
+            # Stream frames paced to wall-clock time (like a real microphone).
+            t_stream_start = time.monotonic()
+            for i, frame in enumerate(frames):
+                await ws.send(frame)
+                if state:
+                    state.frames_sent = i + 1
+                    state.elapsed = time.monotonic() - session_start
+                target = t_stream_start + (i + 1) * FRAME_DURATION
+                delay = target - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+            # Record EOS time right after last audio frame (before silence padding)
+            eos_time = time.monotonic()
+
+            if state:
+                state.status = "flushing"
+                state.elapsed = time.monotonic() - session_start
+
+            if verbose:
+                elapsed = eos_time - session_start
+                log.append(f"  {tag} audio sent ({len(frames)} frames, {elapsed:.3f}s). "
+                           f"Flushing VAD with silence...")
+
+            # Send trailing silence to flush VAD, continuing wall-clock pacing
+            for j in range(SILENCE_PADDING_FRAMES):
+                await ws.send(silence_frame)
+                target = t_stream_start + (len(frames) + j + 1) * FRAME_DURATION
+                delay = target - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+            sending_done.set()
+
+            if state:
+                state.status = "waiting"
+                state.elapsed = time.monotonic() - session_start
+
+            if verbose:
+                elapsed = time.monotonic() - session_start
+                log.append(f"  {tag} all frames sent ({elapsed:.3f}s). "
+                           f"Waiting for results...")
+
+            # Bound how long we wait after sending finishes.
+            cancelled = False
             try:
-                while True:
-                    if not sending_done.is_set():
-                        wait_seconds = timeout
-                    elif last_text_time is not None:
-                        wait_seconds = 5.0
-                    else:
-                        wait_seconds = timeout
-                    raw = await asyncio.wait_for(ws.recv(), timeout=wait_seconds)
-                    msg = json.loads(raw)
-
-                    if "text" in msg and msg["text"].strip():
-                        last_text_time = time.monotonic()
-                        texts.append(msg["text"])
+                await asyncio.wait_for(recv_task, timeout=post_wait)
             except asyncio.TimeoutError:
-                pass
-            except websockets.exceptions.ConnectionClosed:
-                pass
+                cancelled = True
+                recv_task.cancel()
+                try:
+                    await recv_task
+                except asyncio.CancelledError:
+                    pass
 
-        recv_task = asyncio.create_task(receiver())
-
-        # Send audio frames at realtime pace
-        for frame in frames:
-            await ws.send(frame)
-            await asyncio.sleep(FRAME_DURATION)
-
-        # Record EOS time right after last audio frame (before silence padding)
-        eos_time = time.monotonic()
-
-        # Send trailing silence to flush VAD
-        for _ in range(SILENCE_PADDING_FRAMES):
-            await ws.send(silence_frame)
-            await asyncio.sleep(FRAME_DURATION)
-
-        sending_done.set()
-        await recv_task
+    except Exception as exc:
+        if state:
+            state.status = "error"
+            state.error = str(exc)[:80]
+            state.elapsed = time.monotonic() - session_start
+        raise
 
     eos_latency = (last_text_time - eos_time) if last_text_time is not None else timeout
     transcript = " ".join(texts)
+    failed = cancelled and not texts  # only a failure if we got no transcription
+
+    if state:
+        state.status = "error" if failed else "done"
+        state.eos_latency = eos_latency
+        state.elapsed = time.monotonic() - session_start
+
+    if verbose:
+        elapsed = time.monotonic() - session_start
+        status = "FAIL (no transcription)" if failed else "OK"
+        log.append(f"  {tag} {status} ({elapsed:.3f}s) eos_latency={eos_latency:.3f}s "
+                   f"texts={len(texts)} transcript={transcript[:60]}...")
 
     return SessionResult(
         eos_latency=eos_latency,
         audio_duration=sample.duration,
         transcript=transcript,
         reference=sample.text,
+        session_id=session_id,
+        cancelled=failed,
+        log_lines=log,
     )
+
+
+STATUS_STYLES = {
+    "pending": "dim",
+    "connecting": "cyan",
+    "streaming": "yellow",
+    "flushing": "yellow",
+    "waiting": "blue",
+    "done": "green",
+    "error": "red bold",
+}
+
+
+def render_live_panel(
+    states: list[SessionState],
+    concurrency: int,
+    title: str = "",
+) -> Table:
+    """Build a Rich Table showing live session states."""
+    done_count = sum(1 for s in states if s.status in ("done", "error"))
+    header = f"Concurrency: {concurrency}  [{done_count}/{len(states)} done]"
+    if title:
+        header = f"{title}  {header}"
+
+    table = Table(title=header, expand=False, padding=(0, 1))
+    table.add_column("Session", style="bold", width=7)
+    table.add_column("Status", width=12)
+    table.add_column("Progress", width=9)
+    table.add_column("Msgs", justify="right", width=5)
+    table.add_column("Texts", justify="right", width=5)
+    table.add_column("Elapsed", justify="right", width=8)
+    table.add_column("Preview", max_width=40, no_wrap=True)
+
+    for s in states:
+        style = STATUS_STYLES.get(s.status, "")
+        status_text = Text(s.status, style=style)
+        progress = f"{s.frames_sent}/{s.total_frames}" if s.total_frames else "-"
+        elapsed_str = f"{s.elapsed:.1f}s" if s.elapsed > 0 else "-"
+        preview = s.error if s.status == "error" else s.transcript_preview
+        table.add_row(
+            f"S{s.session_id:02d}",
+            status_text,
+            progress,
+            str(s.msgs_received),
+            str(s.texts_received),
+            elapsed_str,
+            preview or "",
+        )
+
+    return table
 
 
 # ---------------------------------------------------------------------------
@@ -444,26 +656,63 @@ async def run_benchmark(
     samples: list[AudioSample],
     concurrency: int,
     timeout: float,
+    verbose: bool = False,
+    post_wait: float = POST_SEND_WAIT,
 ) -> list[SessionResult]:
     """Run *concurrency* parallel STT sessions, each with a unique audio sample."""
-    print(f"\n  Concurrency={concurrency}...", end=" ", flush=True)
+    states = [SessionState(session_id=i) for i in range(concurrency)]
 
     tasks = [
-        run_session(stt_url, samples[i % len(samples)], timeout, session_id=i)
+        run_session(stt_url, samples[i % len(samples)], timeout, session_id=i,
+                    verbose=verbose, post_wait=post_wait, state=states[i])
         for i in range(concurrency)
     ]
-    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def _refresh(live: Live):
+        """Background task: refresh the live display every 0.5s."""
+        try:
+            while True:
+                live.update(render_live_panel(states, concurrency))
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass
+
+    with Live(render_live_panel(states, concurrency), console=console,
+              refresh_per_second=4, transient=True) as live:
+        refresh_task = asyncio.create_task(_refresh(live))
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
+        # Final snapshot before the live display disappears
+        live.update(render_live_panel(states, concurrency))
+
+    # Print a static final status line after the live display clears
     valid: list[SessionResult] = []
     errors = 0
-    for outcome in outcomes:
+    cancelled = 0
+    for i, outcome in enumerate(outcomes):
         if isinstance(outcome, BaseException):
             errors += 1
-            print(f"[session error: {outcome}]", file=sys.stderr)
+            states[i].status = "error"
+            states[i].error = str(outcome)[:80]
+            console.print(f"  [red][session {i} error: {outcome}][/red]", highlight=False)
         else:
             valid.append(outcome)
+            if outcome.cancelled:
+                cancelled += 1
 
-    print(f"done ({len(valid)} ok, {errors} errors)")
+    # Print the final panel (non-transient) so it persists in scrollback
+    console.print(render_live_panel(states, concurrency))
+
+    parts = [f"{len(valid) - cancelled} ok"]
+    if cancelled:
+        parts.append(f"{cancelled} cancelled")
+    if errors:
+        parts.append(f"{errors} errors")
+    console.print(f"  Done: {', '.join(parts)}")
     return valid
 
 
@@ -527,14 +776,16 @@ def compute_wer(reference: str, hypothesis: str) -> float:
             ref_norm = " ".join(ref_norms)
 
         return jiwer.wer(ref_norm, hyp_norm)
-    except Exception:
+    except Exception as exc:
+        logger.warning("WER computation failed: %s (ref=%r, hyp=%r)", exc,
+                       reference[:80], hypothesis[:80])
         return -1.0
 
 
 REPORT_HEADER = (
     f"{'Conc':>4}  "
     f"{'EOS p50':>8} {'EOS p95':>8} {'EOS mean':>9}  "
-    f"{'Audio Dur':>9}  {'WER%':>6}  "
+    f"{'Audio Dur':>9}  {'WER%':>6}  {'Fail':>6}  "
     f"{'GPU%p95':>7} {'GPU%mean':>8}  "
     f"{'VRAM peak':>9} {'VRAM mean':>9}"
 )
@@ -547,16 +798,25 @@ def compute_entry_row(entry: dict) -> dict | None:
     if not sessions:
         return None
 
-    eos_lats = [s.eos_latency for s in sessions]
-    audio_dur = statistics.mean(s.audio_duration for s in sessions)
+    total = len(sessions)
+    cancelled = sum(1 for s in sessions if s.cancelled)
+    good = [s for s in sessions if not s.cancelled]
 
-    eos_p50 = percentile(eos_lats, 50)
-    eos_p95 = percentile(eos_lats, 95)
-    eos_mean = statistics.mean(eos_lats)
+    # Use only non-cancelled sessions for latency/WER metrics
+    if good:
+        eos_lats = [s.eos_latency for s in good]
+        audio_dur = statistics.mean(s.audio_duration for s in good)
+        eos_p50 = percentile(eos_lats, 50)
+        eos_p95 = percentile(eos_lats, 95)
+        eos_mean = statistics.mean(eos_lats)
+        wers = [compute_wer(s.reference, s.transcript) for s in good]
+        valid_wers = [w for w in wers if w >= 0]
+        wer = statistics.mean(valid_wers) if valid_wers else -1.0
+    else:
+        audio_dur = statistics.mean(s.audio_duration for s in sessions)
+        eos_p50 = eos_p95 = eos_mean = -1.0
+        wer = -1.0
 
-    wers = [compute_wer(s.reference, s.transcript) for s in sessions]
-    valid_wers = [w for w in wers if w >= 0]
-    wer = statistics.mean(valid_wers) if valid_wers else -1.0
     wer_pct = wer * 100 if wer >= 0 else -1.0
 
     return {
@@ -566,6 +826,8 @@ def compute_entry_row(entry: dict) -> dict | None:
         "eos_mean": round(eos_mean, 4),
         "audio_duration_s": round(audio_dur, 2),
         "wer_pct": round(wer_pct, 2),
+        "cancelled": cancelled,
+        "total": total,
         "gpu_util_p95": gpu_stats.get("gpu_util_p95"),
         "gpu_util_mean": gpu_stats.get("gpu_util_mean"),
         "vram_peak_mib": gpu_stats.get("vram_peak_mib"),
@@ -580,17 +842,20 @@ def format_row(row: dict) -> str:
     vram_peak = row["vram_peak_mib"]
     vram_mean = row["vram_mean_mib"]
     wer_pct = row["wer_pct"]
+    cancelled = row.get("cancelled", 0)
+    total = row.get("total", row["concurrency"])
 
     gpu_p95_str = f"{gpu_util_p95:.0f}%" if gpu_util_p95 is not None else "n/a"
     gpu_mean_str = f"{gpu_util_mean:.0f}%" if gpu_util_mean is not None else "n/a"
     vram_peak_str = f"{vram_peak} MiB" if vram_peak is not None else "n/a"
     vram_mean_str = f"{vram_mean:.0f} MiB" if vram_mean is not None else "n/a"
     wer_str = f"{wer_pct:.2f}%" if wer_pct >= 0 else "n/a"
+    fail_str = f"{cancelled}/{total}" if cancelled else f"0/{total}"
 
     return (
         f"{row['concurrency']:>4}  "
         f"{row['eos_p50']:>8.4f} {row['eos_p95']:>8.4f} {row['eos_mean']:>9.4f}  "
-        f"{row['audio_duration_s']:>8.2f}s  {wer_str:>6}  "
+        f"{row['audio_duration_s']:>8.2f}s  {wer_str:>6}  {fail_str:>6}  "
         f"{gpu_p95_str:>7} {gpu_mean_str:>8}  "
         f"{vram_peak_str:>9} {vram_mean_str:>9}"
     )
@@ -629,7 +894,8 @@ def write_csv(rows: list[dict], output_path: str) -> None:
 # ---------------------------------------------------------------------------
 # Probe / diagnostic
 # ---------------------------------------------------------------------------
-async def probe_session(stt_url: str, sample: AudioSample, timeout: float):
+async def probe_session(stt_url: str, sample: AudioSample, timeout: float,
+                        post_wait: float = POST_SEND_WAIT):
     """Single verbose session for diagnosing connectivity issues."""
     pcm_int16 = sample.pcm_int16
     frames: list[bytes] = []
@@ -648,54 +914,95 @@ async def probe_session(stt_url: str, sample: AudioSample, timeout: float):
     got_text = False
 
     async with websockets.connect(stt_url, ping_interval=None, ping_timeout=None) as ws:
-        print("  Connected. Streaming at realtime pace...")
+        print("  Connected. Streaming at realtime pace (wall-clock paced)...")
         start = time.monotonic()
-        sending_done = asyncio.Event()
         msg_count = 0
+        sending_done = asyncio.Event()
 
         async def receiver():
             nonlocal msg_count, got_text
+            queued_count = 0
+            results_received = 0
+
+            def _all_results_in() -> bool:
+                return (sending_done.is_set()
+                        and results_received >= queued_count > 0)
+
             try:
                 while True:
-                    # Full timeout while still sending; after sending, 5s after last text
-                    if not sending_done.is_set():
-                        wait = timeout
-                    elif got_text:
-                        wait = 5.0
-                    else:
-                        wait = timeout
-                    raw = await asyncio.wait_for(ws.recv(), timeout=wait)
-                    msg = json.loads(raw)
-                    elapsed = time.monotonic() - start
-                    msg_count += 1
-                    kind = "TEXT" if "text" in msg else "status"
-                    if "text" in msg:
-                        got_text = True
-                    print(f"  [{elapsed:7.3f}s] #{msg_count} [{kind}]: {msg}")
-            except asyncio.TimeoutError:
-                elapsed = time.monotonic() - start
-                print(f"  [{elapsed:7.3f}s] receiver timeout ({msg_count} msgs)")
+                    recv_fut = asyncio.ensure_future(ws.recv())
+                    done_fut = asyncio.ensure_future(sending_done.wait())
+                    done, pending = await asyncio.wait(
+                        [recv_fut, done_fut],
+                        timeout=timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for fut in pending:
+                        fut.cancel()
+
+                    if not done:
+                        elapsed = time.monotonic() - start
+                        print(f"  [{elapsed:7.3f}s] receiver timeout ({msg_count} msgs)")
+                        break
+
+                    if recv_fut in done:
+                        raw = recv_fut.result()
+                        msg = json.loads(raw)
+                        elapsed = time.monotonic() - start
+                        msg_count += 1
+                        kind = "TEXT" if "text" in msg else "status"
+                        if msg.get("status") == "queued":
+                            queued_count += 1
+                        if "text" in msg:
+                            got_text = True
+                            results_received += 1
+                        print(f"  [{elapsed:7.3f}s] #{msg_count} [{kind}]: {msg}")
+
+                    if _all_results_in():
+                        elapsed = time.monotonic() - start
+                        print(f"  [{elapsed:7.3f}s] all {results_received} result(s) "
+                              f"received — exiting early")
+                        break
             except websockets.exceptions.ConnectionClosed as e:
                 print(f"  Connection closed: {e}")
+            except asyncio.CancelledError:
+                elapsed = time.monotonic() - start
+                print(f"  [{elapsed:7.3f}s] receiver cancelled ({msg_count} msgs)")
 
         recv_task = asyncio.create_task(receiver())
 
-        for frame in frames:
+        # Wall-clock paced sending
+        t_stream_start = time.monotonic()
+        for i, frame in enumerate(frames):
             await ws.send(frame)
-            await asyncio.sleep(FRAME_DURATION)
+            target = t_stream_start + (i + 1) * FRAME_DURATION
+            delay = target - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
 
         send_elapsed = time.monotonic() - start
         print(f"  [{send_elapsed:7.3f}s] Audio sent. Sending silence to flush VAD...")
 
-        for _ in range(SILENCE_PADDING_FRAMES):
+        for j in range(SILENCE_PADDING_FRAMES):
             await ws.send(silence_frame)
-            await asyncio.sleep(FRAME_DURATION)
+            target = t_stream_start + (len(frames) + j + 1) * FRAME_DURATION
+            delay = target - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
 
-        silence_elapsed = time.monotonic() - start
-        print(f"  [{silence_elapsed:7.3f}s] Silence sent. Waiting for results...")
         sending_done.set()
+        silence_elapsed = time.monotonic() - start
+        print(f"  [{silence_elapsed:7.3f}s] Silence sent. "
+              f"Waiting for results...")
 
-        await recv_task
+        try:
+            await asyncio.wait_for(recv_task, timeout=post_wait)
+        except asyncio.TimeoutError:
+            recv_task.cancel()
+            try:
+                await recv_task
+            except asyncio.CancelledError:
+                pass
 
     total = time.monotonic() - start
     print(f"\n  Probe complete in {total:.2f}s. Messages received: {msg_count}")
@@ -738,6 +1045,14 @@ async def main() -> None:
         "--gpu-id", type=int, default=None,
         help="GPU device index for monitoring (auto-detected if not set)",
     )
+    parser.add_argument(
+        "--post-wait", type=float, default=POST_SEND_WAIT,
+        help=f"Max seconds to wait for results after all audio is sent (default: {POST_SEND_WAIT:.0f})",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Print per-session send/receive details (frames sent, messages received, timings)",
+    )
     args = parser.parse_args()
 
     concurrency_levels = [int(c) for c in args.concurrency.split(",")]
@@ -756,7 +1071,8 @@ async def main() -> None:
     # Probe mode: single diagnostic session with verbose output
     if args.probe:
         print("\n--- PROBE: single session, verbose ---")
-        await probe_session(args.stt_url, samples[0], args.timeout)
+        await probe_session(args.stt_url, samples[0], args.timeout,
+                            post_wait=args.post_wait)
         return
 
     # Start GPU monitoring
@@ -764,13 +1080,7 @@ async def main() -> None:
     gpu_monitor = GpuMonitor(gpu_id)
     await gpu_monitor.start()
 
-    # Print table header once
-    print("\n" + "=" * len(REPORT_HEADER))
-    print(REPORT_HEADER)
-    print("-" * len(REPORT_HEADER))
-
     all_results: list[dict] = []
-    rows: list[dict] = []
     for i, concurrency in enumerate(concurrency_levels):
         gpu_mark = gpu_monitor.mark()
         sessions = await run_benchmark(
@@ -778,6 +1088,8 @@ async def main() -> None:
             samples=samples,
             concurrency=concurrency,
             timeout=args.timeout,
+            verbose=args.verbose,
+            post_wait=args.post_wait,
         )
         gpu_stats = gpu_monitor.slice_stats(gpu_mark)
         entry = {
@@ -787,19 +1099,21 @@ async def main() -> None:
         }
         all_results.append(entry)
 
-        # Print this level's results immediately
-        row = compute_entry_row(entry)
-        if row is not None:
-            rows.append(row)
-            print(format_row(row), flush=True)
-
         if i < len(concurrency_levels) - 1:
             await asyncio.sleep(2.0)  # brief settle between levels
 
-    print("=" * len(REPORT_HEADER))
-
     await gpu_monitor.stop()
 
+    # Dump verbose session logs before summary table (if -v)
+    if args.verbose:
+        console.print()
+        for entry in all_results:
+            for result in sorted(entry["sessions"], key=lambda r: r.session_id):
+                for line in result.log_lines:
+                    console.print(line, highlight=False)
+
+    # Print clean summary table at the end
+    rows = print_report(all_results)
     write_csv(rows, args.output)
 
 

@@ -9,3 +9,10 @@ pytest
 python-multipart
 ffmpeg-python
 python-dotenv
+
+# Benchmark dependencies (benchmark_stt.py)
+httpx
+soundfile
+websockets
+rich
+jiwer

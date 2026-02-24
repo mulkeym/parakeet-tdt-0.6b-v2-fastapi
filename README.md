@@ -193,33 +193,49 @@ ws.onmessage = evt => {
 
 ## Benchmarking
 
-`benchmark_stt.py` is a realtime streaming concurrency benchmark for the STT service. It generates test audio via a TTS service, streams it over concurrent WebSocket connections at real-time pace, and measures EOS latency, GPU utilization, VRAM usage, and word error rate as concurrency scales up.
+`benchmark_stt.py` is a realtime streaming concurrency benchmark for the STT service. It generates test audio via a TTS service, streams it over concurrent WebSocket connections at real-time pace, and measures EOS latency, word error rate (WER), GPU utilization, and VRAM usage as concurrency scales up.
 
 ### Prerequisites
 
-Install the additional benchmark dependencies:
+All benchmark dependencies are included in `requirements.txt`:
 
 ```bash
-pip install httpx soundfile websockets jiwer
+pip install -r requirements.txt
 ```
 
-A running TTS service is needed to generate test audio. `nvidia-smi` must be available on the benchmark host for GPU metrics (metrics are skipped gracefully if unavailable). The benchmark auto-detects which GPU is running the parakeet process.
+You also need:
+- A running **STT service** (this project) accessible via WebSocket
+- A running **TTS service** (e.g. Chatterbox) to generate test audio on first run
+- `nvidia-smi` on the benchmark host for GPU metrics (skipped gracefully if unavailable)
 
-### Quick Start
+Generated audio is cached locally in `.benchmark_cache/` so the TTS service is only needed on the first run.
+
+### Examples
 
 ```bash
-# Single diagnostic session (check connectivity and see raw messages)
-python benchmark_stt.py --probe
+# Diagnose connectivity — single verbose session showing every WebSocket message
+python benchmark_stt.py --probe --stt-url ws://localhost:8000/ws
 
-# Default benchmark: ramp concurrency 1 -> 5 -> 10 -> 20 -> 30 -> 40
-python benchmark_stt.py
+# Default benchmark — ramp concurrency 1 -> 5 -> 10 -> 20 -> 30 -> 40
+python benchmark_stt.py --stt-url ws://localhost:8000/ws
 
-# Custom run
+# Custom concurrency levels with a specific TTS service and output file
 python benchmark_stt.py \
   --stt-url ws://localhost:8000/ws \
   --tts-url http://localhost:8004/tts \
-  --concurrency 1,5,10,20 \
+  --concurrency 1,10,20,50 \
   --output results.csv
+
+# Verbose mode — print per-session send/receive details for every session
+python benchmark_stt.py --stt-url ws://localhost:8000/ws --concurrency 1,5 -v
+
+# Target a specific GPU for monitoring (instead of auto-detect)
+python benchmark_stt.py --stt-url ws://localhost:8000/ws --gpu-id 3
+
+# Stress test at high concurrency
+python benchmark_stt.py \
+  --stt-url ws://localhost:8000/ws \
+  --concurrency 1,20,40,60,80,100
 ```
 
 ### Options
@@ -227,34 +243,65 @@ python benchmark_stt.py \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--stt-url` | `ws://localhost:8000/ws` | WebSocket URL of the STT service |
-| `--tts-url` | `http://localhost:8004/tts` | HTTP URL of the TTS service used to generate test audio |
+| `--tts-url` | `http://localhost:8004/tts` | HTTP URL of the TTS service for generating test audio |
 | `--concurrency` | `1,5,10,20,30,40` | Comma-separated concurrency levels to ramp through |
 | `--output` | `benchmark_results.csv` | Output CSV file path |
-| `--timeout` | `30.0` | Seconds to wait for transcription results before giving up |
+| `--timeout` | `30.0` | Per-message receive timeout (seconds). Acts as a fallback; the receiver normally exits early once all results are in |
+| `--post-wait` | `30.0` | Hard cap on how long to wait after all audio is sent (seconds) |
+| `--gpu-id` | auto-detected | GPU device index for monitoring. Auto-detected from the process running the STT model |
 | `--probe` | off | Run a single verbose diagnostic session, then exit |
+| `--verbose`, `-v` | off | Print per-session frame/message details and timings during the benchmark |
+
+### How It Works
+
+1. **Audio generation** — The tool generates unique TTS audio for each concurrent session from a pool of reference paragraphs. Audio is cached in `.benchmark_cache/` as `.npz` files so subsequent runs skip TTS entirely.
+
+2. **Real-time streaming** — Each session opens a WebSocket, streams 100ms PCM frames at wall-clock pace (simulating a live microphone), then sends 1 second of silence to flush the server's VAD.
+
+3. **Smart early exit** — The receiver tracks `{"status": "queued"}` messages from the server (one per VAD chunk) and counts text results as they arrive. Once all audio has been sent and every queued chunk has a corresponding result, the session exits immediately instead of waiting for the full `--timeout` period.
+
+4. **Word error rate** — Since audio is generated from known reference text, the tool computes WER by comparing the STT transcript against the original. An order-independent matching algorithm handles cases where batched inference returns chunks out of order.
+
+5. **GPU monitoring** — `nvidia-smi dmon` runs in the background sampling utilization and VRAM at 1Hz. The benchmark auto-detects which GPU is running the parakeet process.
 
 ### Reported Metrics
 
 | Metric | Description |
 |--------|-------------|
-| EOS Latency (p50/p95/mean) | End-of-speech latency: time from last audio frame sent to final transcript received. This is what a voice agent user feels as "waiting for the system to understand." |
+| EOS Latency (p50/p95/mean) | Time from last audio frame sent to final transcript received. This is what a voice agent user feels as "waiting for the system to understand." |
 | Audio Duration | Average length of the test speech clips (seconds) |
-| WER% | Word error rate as a percentage vs. the known reference text |
-| GPU% (p95/mean) | GPU SM utilization during the concurrency level (sampled at 1Hz via `nvidia-smi dmon`) |
+| WER% | Word error rate vs. the known reference text. Requires `jiwer` (`pip install jiwer`). Shows `n/a` if the library is missing |
+| GPU% (p95/mean) | GPU SM utilization during the concurrency level (sampled at 1Hz) |
 | VRAM (peak/mean) | GPU memory usage in MiB during the concurrency level |
+| Fail | Number of sessions that received no transcription vs. total sessions |
 
-### GPU Monitoring
+### Sample Output
 
-The benchmark automatically detects which GPU is running the parakeet service by inspecting `nvidia-smi` process listings. It then spawns `nvidia-smi dmon` in the background to sample GPU utilization and VRAM at 1-second intervals. Per-concurrency-level stats (p95/mean for utilization, peak/mean for VRAM) are computed from samples collected during that level's run.
-
-If `nvidia-smi` is not available, GPU columns show `n/a` and the benchmark continues without GPU metrics.
+```
+Conc   EOS p50  EOS p95  EOS mean  Audio Dur    WER%    Fail  GPU%p95 GPU%mean  VRAM peak VRAM mean
+   1    0.2820   0.2820    0.2820      7.44s   0.00%     0/1       0%       0%   5169 MiB  5169 MiB
+   5    0.3533   0.6436    0.4238      7.50s   1.95%     0/5      20%       4%   5169 MiB  5169 MiB
+  10    0.4123   0.7799    0.4483      7.66s   2.85%    0/10      31%       7%   5169 MiB  5169 MiB
+```
 
 ### Probe Mode
 
 Use `--probe` for a single verbose session that prints every WebSocket message with timestamps. Useful for diagnosing connectivity issues, checking that the STT service returns results, and verifying VAD flush behavior.
 
-```bash
-python benchmark_stt.py --probe --stt-url ws://localhost:8000/ws
+```
+$ python benchmark_stt.py --probe --stt-url ws://localhost:8000/ws
+
+  Connecting to ws://localhost:8000/ws ...
+  Connected. Streaming at realtime pace (wall-clock paced)...
+  [  4.006s] #1 [status]: {'status': 'queued'}
+  [  4.303s] #2 [TEXT]:   {'text': 'The quick brown fox jumps over the lazy dog...'}
+  [  7.501s] Audio sent. Sending silence to flush VAD...
+  [  7.506s] #3 [status]: {'status': 'queued'}
+  [  7.780s] #4 [TEXT]:   {'text': 'She sells seashells by the seashore...'}
+  [  8.501s] Silence sent. Waiting for results...
+  [  8.501s] all 2 result(s) received — exiting early
+
+  Probe complete in 8.50s. Messages received: 4
 ```
 
 ## Architecture Overview
