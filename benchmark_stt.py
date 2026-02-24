@@ -611,20 +611,16 @@ async def probe_session(stt_url: str, sample: AudioSample, timeout: float):
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark Parakeet STT service")
     parser.add_argument(
-        "--stt-url", default="ws://192.168.1.181:81/ws",
+        "--stt-url", default="ws://localhost:8000/ws",
         help="WebSocket URL for the STT service",
     )
     parser.add_argument(
-        "--tts-url", default="http://192.168.1.181:8004/tts",
+        "--tts-url", default="http://localhost:8004/tts",
         help="HTTP URL for the Chatterbox TTS service",
     )
     parser.add_argument(
-        "--concurrency", default="1,2,3,5,7,10",
+        "--concurrency", default="1,5,10,20,30,40",
         help="Comma-separated concurrency levels to test",
-    )
-    parser.add_argument(
-        "--modes", default="realtime,fast",
-        help="Comma-separated send modes (realtime, fast)",
     )
     parser.add_argument(
         "--output", default="benchmark_results.csv",
@@ -641,7 +637,6 @@ async def main() -> None:
     args = parser.parse_args()
 
     concurrency_levels = [int(c) for c in args.concurrency.split(",")]
-    modes = [m.strip() for m in args.modes.split(",")]
     max_concurrency = max(concurrency_levels)
 
     # Generate unique audio for each concurrent session
@@ -652,35 +647,37 @@ async def main() -> None:
     print(f"\nAudio pool ready: {len(samples)} samples, "
           f"avg duration {avg_duration:.2f}s")
     print(f"Concurrency levels: {concurrency_levels}")
-    print(f"Modes: {modes}")
     print(f"Output: {args.output}")
 
     # Probe mode: single diagnostic session with verbose output
     if args.probe:
-        print("\n--- PROBE: single session, realtime mode, verbose ---")
+        print("\n--- PROBE: single session, verbose ---")
         await probe_session(args.stt_url, samples[0], args.timeout)
         return
 
+    # Start GPU monitoring
+    gpu_id = detect_gpu_id()
+    gpu_monitor = GpuMonitor(gpu_id)
+    await gpu_monitor.start()
+
     all_results: list[dict] = []
-    for mode in modes:
-        print(f"\n{'='*60}")
-        print(f"  Mode: {mode}")
-        print(f"{'='*60}")
-        for concurrency in concurrency_levels:
-            sessions = await run_benchmark(
-                stt_url=args.stt_url,
-                samples=samples,
-                concurrency=concurrency,
-                mode=mode,
-                timeout=args.timeout,
-            )
-            all_results.append({
-                "mode": mode,
-                "concurrency": concurrency,
-                "audio_duration": avg_duration,
-                "sessions": sessions,
-            })
-            await asyncio.sleep(2.0)
+    for concurrency in concurrency_levels:
+        gpu_mark = gpu_monitor.mark()
+        sessions = await run_benchmark(
+            stt_url=args.stt_url,
+            samples=samples,
+            concurrency=concurrency,
+            timeout=args.timeout,
+        )
+        gpu_stats = gpu_monitor.slice_stats(gpu_mark)
+        all_results.append({
+            "concurrency": concurrency,
+            "sessions": sessions,
+            "gpu_stats": gpu_stats,
+        })
+        await asyncio.sleep(3.0)  # let GPU settle between levels
+
+    await gpu_monitor.stop()
 
     rows = print_report(all_results)
     write_csv(rows, args.output)
