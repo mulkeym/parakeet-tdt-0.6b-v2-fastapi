@@ -77,18 +77,19 @@ TEXT_POOL = [
 def parse_dmon_line(line: str) -> tuple[int, int] | None:
     """Parse one line of nvidia-smi dmon output.
 
-    Expected columns (with -s um): gpu_idx, sm%, mem%, fb_used_MiB
+    Columns (with -s um): gpu sm% mem% enc% dec% jpg% ofa% fb(MB) bar1(MB) ccpm(MB)
+    Index:                  0   1    2    3    4    5    6    7       8        9
     Returns (gpu_util_pct, vram_used_mib) or None for headers/blanks.
     """
     line = line.strip()
     if not line or line.startswith("#"):
         return None
     parts = line.split()
-    if len(parts) < 4:
+    if len(parts) < 8:
         return None
     try:
         sm_pct = int(parts[1])
-        fb_mib = int(parts[3])
+        fb_mib = int(parts[7])
         return (sm_pct, fb_mib)
     except (ValueError, IndexError):
         return None
@@ -112,10 +113,16 @@ def compute_gpu_stats(samples: list[tuple[int, int]]) -> dict:
 
 
 def detect_gpu_id() -> int:
-    """Find the GPU running a python process via nvidia-smi. Returns device index or 0."""
+    """Find the GPU running the parakeet service via nvidia-smi.
+
+    Queries nvidia-smi for compute apps with full process names. Prefers
+    processes whose command path contains 'parakeet' or 'nemo', falling
+    back to any python process on a GPU. Returns device index or 0.
+    """
     try:
         apps = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader"],
+            ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid,process_name",
+             "--format=csv,noheader"],
             capture_output=True, text=True, timeout=5,
         )
         gpu_uuids = subprocess.run(
@@ -128,21 +135,33 @@ def detect_gpu_id() -> int:
             if len(parts) == 2:
                 uuid_to_idx[parts[1]] = int(parts[0])
 
+        # Collect all python processes with their GPU index and process name
+        candidates: list[tuple[int, str, str]] = []  # (gpu_idx, pid, process_name)
         for line in apps.stdout.strip().splitlines():
             parts = [p.strip() for p in line.split(",")]
-            if len(parts) == 2:
-                pid_str, gpu_uuid = parts
-                try:
-                    cmd = subprocess.run(
-                        ["ps", "-p", pid_str, "-o", "comm="],
-                        capture_output=True, text=True, timeout=2,
-                    )
-                    if "python" in cmd.stdout.lower():
-                        idx = uuid_to_idx.get(gpu_uuid, 0)
-                        logger.info("Detected parakeet on GPU %d (PID %s)", idx, pid_str)
-                        return idx
-                except Exception:
-                    pass
+            if len(parts) >= 3:
+                pid_str, gpu_uuid, proc_name = parts[0], parts[1], parts[2]
+                if "python" in proc_name.lower():
+                    idx = uuid_to_idx.get(gpu_uuid, 0)
+                    candidates.append((idx, pid_str, proc_name))
+
+        if not candidates:
+            logger.warning("No python GPU processes found, defaulting to device 0")
+            return 0
+
+        # Prefer processes whose path suggests parakeet/nemo/uvicorn
+        for idx, pid, name in candidates:
+            name_lower = name.lower()
+            if any(hint in name_lower for hint in ("parakeet", "nemo", "uvicorn")):
+                logger.info("Detected parakeet on GPU %d (PID %s, %s)", idx, pid, name)
+                return idx
+
+        # Fall back to the python process using the most VRAM (likely the ASR model)
+        # by picking the last candidate (nvidia-smi tends to list larger processes later)
+        idx, pid, name = candidates[-1]
+        logger.info("Best-guess parakeet on GPU %d (PID %s, %s)", idx, pid, name)
+        return idx
+
     except Exception as exc:
         logger.warning("GPU auto-detect failed: %s", exc)
     logger.warning("Could not detect GPU, defaulting to device 0")
@@ -330,12 +349,14 @@ async def run_session(
             await ws.send(frame)
             await asyncio.sleep(FRAME_DURATION)
 
+        # Record EOS time right after last audio frame (before silence padding)
+        eos_time = time.monotonic()
+
         # Send trailing silence to flush VAD
         for _ in range(SILENCE_PADDING_FRAMES):
             await ws.send(silence_frame)
             await asyncio.sleep(FRAME_DURATION)
 
-        eos_time = time.monotonic()
         sending_done.set()
         await recv_task
 
@@ -634,6 +655,10 @@ async def main() -> None:
         "--probe", action="store_true",
         help="Run a single diagnostic session with verbose output, then exit",
     )
+    parser.add_argument(
+        "--gpu-id", type=int, default=None,
+        help="GPU device index for monitoring (auto-detected if not set)",
+    )
     args = parser.parse_args()
 
     concurrency_levels = [int(c) for c in args.concurrency.split(",")]
@@ -656,7 +681,7 @@ async def main() -> None:
         return
 
     # Start GPU monitoring
-    gpu_id = detect_gpu_id()
+    gpu_id = args.gpu_id if args.gpu_id is not None else detect_gpu_id()
     gpu_monitor = GpuMonitor(gpu_id)
     await gpu_monitor.start()
 

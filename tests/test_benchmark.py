@@ -8,13 +8,13 @@ class TestParseDmonLine:
 
     def test_parses_valid_line(self):
         from benchmark_stt import parse_dmon_line
-        # dmon output columns: gpu idx, sm%, mem%, fb_used_MiB
-        result = parse_dmon_line("    0   45   32   1842")
+        # dmon columns: gpu sm% mem% enc% dec% jpg% ofa% fb(MB) bar1(MB) ccpm(MB)
+        result = parse_dmon_line("    0   45   32     0     0     0     0   1842      7      0")
         assert result == (45, 1842)
 
     def test_skips_header_line(self):
         from benchmark_stt import parse_dmon_line
-        assert parse_dmon_line("# gpu   sm   mem    fb") is None
+        assert parse_dmon_line("# gpu     sm    mem    enc    dec    jpg    ofa     fb   bar1   ccpm") is None
 
     def test_skips_blank_line(self):
         from benchmark_stt import parse_dmon_line
@@ -27,12 +27,12 @@ class TestParseDmonLine:
 
     def test_handles_high_values(self):
         from benchmark_stt import parse_dmon_line
-        result = parse_dmon_line("    0   99   95  24564")
+        result = parse_dmon_line("    0   99   95     0     0     0     0  24564      7      0")
         assert result == (99, 24564)
 
     def test_handles_zero_values(self):
         from benchmark_stt import parse_dmon_line
-        result = parse_dmon_line("    0    0    0     0")
+        result = parse_dmon_line("    0    0    0     0     0     0     0     0      0      0")
         assert result == (0, 0)
 
 
