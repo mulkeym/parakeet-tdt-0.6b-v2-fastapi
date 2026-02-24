@@ -38,14 +38,26 @@ POST_SEND_WAIT = 30.0  # max seconds to wait for results after all audio is sent
 
 # Pool of unique paragraphs -- each concurrent session gets a different one.
 # This catches cross-session result leaking or stale-data memory bugs.
+# Lengths vary from ~5s (short) to ~15s (long) for realistic mixed workloads.
 TEXT_POOL = [
-    (
-        "The quick brown fox jumps over the lazy dog near the riverbank. "
-        "She sells seashells by the seashore every Sunday morning."
-    ),
+    # --- Short (~5-6 s, one to two short sentences) ---
+    "The quick brown fox jumps over the lazy dog near the riverbank on a warm afternoon.",
+    "She sells seashells by the seashore every Sunday morning before the crowds arrive.",
+    "A gentle breeze carried the scent of wildflowers across the open meadow at sunset.",
+    "Children played in the park while their parents watched quietly from the wooden bench.",
+    "The bakery on the corner filled the entire street with the wonderful aroma of fresh bread.",
+    "Autumn leaves drifted slowly from the tall maple trees lining the quiet boulevard.",
+    "Construction workers began pouring the new concrete foundation early on Monday morning.",
+    "The weather forecast predicts sunny skies and mild temperatures throughout the day today.",
+    "Marine biologists documented several previously unknown species of deep sea creatures.",
+    "The submarine descended quietly into the dark and freezing waters of the continental shelf.",
+    "Violins and cellos blended together beautifully in a hauntingly emotional melody.",
+    "The architect carefully designed a building that harmonized perfectly with the surrounding landscape.",
+    "Students gathered eagerly around the laboratory table to observe the dramatic chemical reaction.",
+    # --- Medium (~8-10 s, two sentences) ---
     (
         "A journey of a thousand miles begins with a single step forward. "
-        "The weather forecast predicts sunny skies and mild temperatures today."
+        "The mountain trail wound through ancient pine forests and crystal clear streams."
     ),
     (
         "Musicians practiced their instruments diligently before the evening concert. "
@@ -53,31 +65,108 @@ TEXT_POOL = [
     ),
     (
         "The old lighthouse keeper watched the ships sail through the foggy harbor. "
-        "Children played in the park while their parents read books on the bench."
-    ),
-    (
-        "The mountain trail wound through ancient pine forests and crystal clear streams. "
-        "A gentle breeze carried the scent of wildflowers across the meadow."
+        "Fishermen returned at dawn with their nets heavy from the overnight catch."
     ),
     (
         "The professor explained the complex equation with remarkable clarity and patience. "
-        "Students gathered around the laboratory table to observe the chemical reaction."
-    ),
-    (
-        "Autumn leaves drifted slowly from the maple trees lining the quiet boulevard. "
-        "The bakery on the corner filled the entire street with the aroma of fresh bread."
-    ),
-    (
-        "The submarine descended into the dark waters of the continental shelf. "
-        "Marine biologists documented several previously unknown deep sea creatures."
-    ),
-    (
-        "The architect designed a building that harmonized perfectly with the landscape. "
-        "Construction workers began pouring the foundation early Monday morning."
+        "Her students took careful notes and asked thoughtful questions after the lecture."
     ),
     (
         "The orchestra conductor raised her baton and the symphony hall fell silent. "
-        "Violins and cellos blended together in a hauntingly beautiful melody."
+        "Every musician held their breath waiting for the downbeat to begin the overture."
+    ),
+    (
+        "Heavy rain pounded against the windows of the old farmhouse all through the night. "
+        "By morning the creek had risen three feet and flooded the lower pasture."
+    ),
+    (
+        "The detective examined the crime scene carefully looking for any overlooked evidence. "
+        "A single fingerprint on the doorframe would eventually crack the entire case."
+    ),
+    (
+        "The astronaut gazed out the window of the space station at the Earth below. "
+        "Clouds swirled over the Pacific Ocean creating mesmerizing spiral patterns."
+    ),
+    (
+        "The chef prepared an elaborate seven course meal for the visiting dignitaries. "
+        "Each dish showcased locally sourced ingredients and traditional cooking techniques."
+    ),
+    (
+        "Volunteers spent the entire weekend cleaning up the riverbank after the flood. "
+        "They collected over two thousand pounds of debris and recycled what they could."
+    ),
+    (
+        "The librarian organized a summer reading program for children of all ages. "
+        "Hundreds of families signed up within the first week of the announcement."
+    ),
+    (
+        "The pilot navigated through turbulent weather over the Rocky Mountains. "
+        "Passengers gripped their armrests as the plane bounced through heavy crosswinds."
+    ),
+    (
+        "The marathon runner pushed through the final miles despite the blistering heat. "
+        "Spectators along the course offered water and encouragement to every participant."
+    ),
+    # --- Long (~12-15 s, three to four sentences) ---
+    (
+        "The research team spent six months in the Arctic studying polar bear migration patterns. "
+        "They deployed satellite tracking collars on twelve bears across three different regions. "
+        "The data revealed surprising shifts in feeding behavior linked to sea ice reduction."
+    ),
+    (
+        "The city council approved a new public transit plan that would add fifteen bus routes. "
+        "Construction of the first dedicated bus lane is scheduled to begin next spring. "
+        "Residents in underserved neighborhoods expressed strong support for the expansion."
+    ),
+    (
+        "The photographer waited three hours in the freezing rain for the perfect shot. "
+        "When the sun finally broke through the clouds it illuminated the valley below. "
+        "The resulting image won first place in the national landscape photography competition."
+    ),
+    (
+        "The software engineer debugged a critical issue that had been crashing the server for weeks. "
+        "After tracing the problem through thousands of lines of code she found a subtle race condition. "
+        "The fix was only two lines long but it required deep understanding of the entire system."
+    ),
+    (
+        "The ancient Roman aqueduct stretched for miles across the dry Spanish countryside. "
+        "Engineers built it over two thousand years ago using precisely cut granite blocks. "
+        "Remarkably the structure still stands today as a testament to Roman engineering skill."
+    ),
+    (
+        "The veterinarian treated a young elephant that had been injured by poachers in the reserve. "
+        "After weeks of careful rehabilitation the animal was strong enough to rejoin its herd. "
+        "Park rangers monitored its recovery using GPS trackers attached to a lightweight collar."
+    ),
+    (
+        "The film director spent three years developing a screenplay based on a true story. "
+        "She interviewed dozens of people who had lived through the events depicted in the film. "
+        "Critics praised the movie for its authenticity and emotional depth at the premiere."
+    ),
+    (
+        "The farmer rotated crops across four different fields to maintain healthy soil throughout the year. "
+        "Corn and soybeans alternated with cover crops of clover and winter rye in a careful sequence. "
+        "This sustainable approach doubled the farm's yield within just five growing seasons."
+    ),
+    (
+        "The museum curator assembled a traveling exhibition featuring impressionist paintings from private collections. "
+        "Works by Monet Renoir and Degas were displayed alongside lesser known artists of the same period. "
+        "The exhibition drew record attendance in every city during its eighteen month international tour."
+    ),
+    (
+        "The emergency response team arrived at the earthquake site within four hours of the initial tremor. "
+        "They set up a field hospital and began treating survivors pulled from the collapsed buildings. "
+        "International aid organizations coordinated supply drops of food water and medical equipment."
+    ),
+    (
+        "The deep sea exploration vessel descended to nearly four thousand meters below the ocean surface. "
+        "Scientists aboard discovered hydrothermal vents surrounded by ecosystems never before documented. "
+        "Tube worms and eyeless shrimp thrived in the superheated mineral rich water near the vents."
+    ),
+    (
+        "The school principal introduced a new program that paired older students with younger reading buddies. "
+        "Every Tuesday and Thursday afternoon the pairs met in the library for thirty minute sessions. "
+        "Reading scores among the younger students improved by twenty percent over the course of the semester."
     ),
 ]
 

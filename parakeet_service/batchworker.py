@@ -75,10 +75,13 @@ async def batch_worker(model, batch_ms: float = None, max_batch: int = None):
 
         chunk_ids = [item[0] for item in batch]
         audio_arrays = [item[1] for item in batch]
+        durations = [f"{len(a)/16000:.2f}s" for a in audio_arrays]
 
-        logger.debug("processing %d-item batch", len(batch))
+        logger.info("batch %s (%d items, audio: %s) -> inference",
+                     chunk_ids, len(batch), ", ".join(durations))
 
         # ---------- inference (in thread pool) ----------
+        t0 = time.monotonic()
         try:
             outs = await asyncio.to_thread(
                 _run_inference, model, audio_arrays, len(audio_arrays)
@@ -92,9 +95,21 @@ async def batch_worker(model, batch_ms: float = None, max_batch: int = None):
                 condition.notify_all()
             continue
 
+        inf_ms = (time.monotonic() - t0) * 1000
+
         # ---------- store results & notify ----------
         for cid, h in zip(chunk_ids, outs):
-            results[cid] = _extract_result(h)
+            result = _extract_result(h)
+            results[cid] = result
+            text_preview = (result.get("text", "") or "")[:60]
+            logger.info("  result %s: \"%s\"", cid, text_preview)
             transcription_queue.task_done()
+
+        logger.info("batch done in %.0f ms (queue depth: %d)",
+                     inf_ms, transcription_queue.qsize())
+
+        # Drop references to Hypothesis objects so their GPU tensors can be freed.
+        del outs, audio_arrays, batch
+
         async with condition:
             condition.notify_all()
