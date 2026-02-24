@@ -448,10 +448,11 @@ def compute_wer(reference: str, hypothesis: str) -> float:
 def print_report(all_results: list[dict]) -> list[dict]:
     """Print a formatted results table and return row dicts for CSV output."""
     header = (
-        f"{'Mode':<10} {'Conc':>4}  "
-        f"{'TTFB p50':>9} {'TTFB p95':>9} {'TTFB mean':>9}  "
-        f"{'Total p50':>10} {'Total p95':>10} {'Total mean':>10}  "
-        f"{'RTF':>6}  {'WER':>6}"
+        f"{'Conc':>4}  "
+        f"{'EOS p50':>8} {'EOS p95':>8} {'EOS mean':>9}  "
+        f"{'Audio Dur':>9}  {'WER%':>6}  "
+        f"{'GPU%p95':>7} {'GPU%mean':>8}  "
+        f"{'VRAM peak':>9} {'VRAM mean':>9}"
     )
     print("\n" + "=" * len(header))
     print(header)
@@ -460,47 +461,53 @@ def print_report(all_results: list[dict]) -> list[dict]:
     rows: list[dict] = []
     for entry in all_results:
         sessions: list[SessionResult] = entry["sessions"]
+        gpu_stats: dict = entry.get("gpu_stats", {})
         if not sessions:
             continue
 
-        ttfbs = [s.ttfb for s in sessions]
-        totals = [s.total_time for s in sessions]
-        audio_dur = entry["audio_duration"]
+        eos_lats = [s.eos_latency for s in sessions]
+        audio_dur = statistics.mean(s.audio_duration for s in sessions)
 
-        ttfb_p50 = percentile(ttfbs, 50)
-        ttfb_p95 = percentile(ttfbs, 95)
-        ttfb_mean = statistics.mean(ttfbs)
+        eos_p50 = percentile(eos_lats, 50)
+        eos_p95 = percentile(eos_lats, 95)
+        eos_mean = statistics.mean(eos_lats)
 
-        total_p50 = percentile(totals, 50)
-        total_p95 = percentile(totals, 95)
-        total_mean = statistics.mean(totals)
-
-        rtf = total_mean / audio_dur if audio_dur > 0 else 0.0
-        # Per-session WER: each session compared against its own reference text
         wers = [compute_wer(s.reference, s.transcript) for s in sessions]
         valid_wers = [w for w in wers if w >= 0]
         wer = statistics.mean(valid_wers) if valid_wers else -1.0
+        wer_pct = wer * 100 if wer >= 0 else -1.0
+
+        gpu_util_p95 = gpu_stats.get("gpu_util_p95")
+        gpu_util_mean = gpu_stats.get("gpu_util_mean")
+        vram_peak = gpu_stats.get("vram_peak_mib")
+        vram_mean = gpu_stats.get("vram_mean_mib")
 
         row = {
-            "mode": entry["mode"],
             "concurrency": entry["concurrency"],
+            "eos_p50": round(eos_p50, 4),
+            "eos_p95": round(eos_p95, 4),
+            "eos_mean": round(eos_mean, 4),
             "audio_duration_s": round(audio_dur, 2),
-            "ttfb_p50": round(ttfb_p50, 4),
-            "ttfb_p95": round(ttfb_p95, 4),
-            "ttfb_mean": round(ttfb_mean, 4),
-            "total_p50": round(total_p50, 4),
-            "total_p95": round(total_p95, 4),
-            "total_mean": round(total_mean, 4),
-            "rtf": round(rtf, 4),
-            "wer": round(wer, 4),
+            "wer_pct": round(wer_pct, 2),
+            "gpu_util_p95": gpu_util_p95,
+            "gpu_util_mean": gpu_util_mean,
+            "vram_peak_mib": vram_peak,
+            "vram_mean_mib": vram_mean,
         }
         rows.append(row)
 
+        gpu_p95_str = f"{gpu_util_p95:.0f}%" if gpu_util_p95 is not None else "n/a"
+        gpu_mean_str = f"{gpu_util_mean:.0f}%" if gpu_util_mean is not None else "n/a"
+        vram_peak_str = f"{vram_peak} MiB" if vram_peak is not None else "n/a"
+        vram_mean_str = f"{vram_mean:.0f} MiB" if vram_mean is not None else "n/a"
+        wer_str = f"{wer_pct:.2f}%" if wer_pct >= 0 else "n/a"
+
         print(
-            f"{row['mode']:<10} {row['concurrency']:>4}  "
-            f"{row['ttfb_p50']:>9.4f} {row['ttfb_p95']:>9.4f} {row['ttfb_mean']:>9.4f}  "
-            f"{row['total_p50']:>10.4f} {row['total_p95']:>10.4f} {row['total_mean']:>10.4f}  "
-            f"{row['rtf']:>6.4f}  {row['wer']:>6.4f}"
+            f"{row['concurrency']:>4}  "
+            f"{row['eos_p50']:>8.4f} {row['eos_p95']:>8.4f} {row['eos_mean']:>9.4f}  "
+            f"{row['audio_duration_s']:>8.2f}s  {wer_str:>6}  "
+            f"{gpu_p95_str:>7} {gpu_mean_str:>8}  "
+            f"{vram_peak_str:>9} {vram_mean_str:>9}"
         )
 
     print("=" * len(header))

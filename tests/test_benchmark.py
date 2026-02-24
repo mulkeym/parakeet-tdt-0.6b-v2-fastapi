@@ -70,3 +70,16 @@ class TestSessionResult:
         r = SessionResult(eos_latency=0.5, audio_duration=6.0, transcript="hello", reference="hello")
         assert r.eos_latency == 0.5
         assert r.audio_duration == 6.0
+
+
+class TestWerFormatting:
+    def test_wer_as_percentage(self):
+        from benchmark_stt import compute_wer
+        # "hello world" vs "hello world" should be 0%
+        wer = compute_wer("hello world", "hello world")
+        assert wer >= 0
+        assert wer < 0.01  # essentially 0
+
+    def test_wer_returns_negative_on_empty_ref(self):
+        from benchmark_stt import compute_wer
+        assert compute_wer("", "hello") == -1.0
