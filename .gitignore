@@ -127,6 +127,10 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Benchmark cache
+.benchmark_cache/
+benchmark_results.csv
+
 # Environments
 .env
 .venv

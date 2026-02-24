@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 import numpy as np
@@ -278,18 +280,81 @@ async def generate_audio(tts_url: str, text: str) -> AudioSample:
     return AudioSample(text=text, pcm_int16=pcm_int16, duration=duration)
 
 
+CACHE_DIR = Path(".benchmark_cache")
+
+
+def _cache_key(text: str, tts_url: str) -> str:
+    """Stable cache key from text content and TTS endpoint."""
+    h = hashlib.sha256(f"{tts_url}|{text}".encode()).hexdigest()[:12]
+    return h
+
+
+def _load_cached(text: str, tts_url: str) -> AudioSample | None:
+    """Load a cached audio sample if it exists."""
+    key = _cache_key(text, tts_url)
+    path = CACHE_DIR / f"{key}.npz"
+    if not path.exists():
+        return None
+    try:
+        data = np.load(path)
+        pcm_int16 = data["pcm_int16"]
+        duration = len(pcm_int16) / SAMPLE_RATE
+        return AudioSample(text=text, pcm_int16=pcm_int16, duration=duration)
+    except Exception:
+        return None
+
+
+def _save_cached(sample: AudioSample, tts_url: str) -> None:
+    """Save an audio sample to the cache."""
+    CACHE_DIR.mkdir(exist_ok=True)
+    key = _cache_key(sample.text, tts_url)
+    np.savez_compressed(CACHE_DIR / f"{key}.npz", pcm_int16=sample.pcm_int16)
+
+
 async def generate_audio_pool(
-    tts_url: str, count: int,
+    tts_url: str, count: int, max_parallel: int = 5,
 ) -> list[AudioSample]:
-    """Generate *count* unique audio samples from the text pool."""
-    samples: list[AudioSample] = []
-    for i in range(count):
-        text = TEXT_POOL[i % len(TEXT_POOL)]
-        print(f"  Generating audio {i+1}/{count} ({len(text)} chars)...", flush=True)
-        sample = await generate_audio(tts_url, text)
-        print(f"    -> {sample.duration:.2f}s, {len(sample.pcm_int16)} samples")
-        samples.append(sample)
-    return samples
+    """Generate *count* unique audio samples, using cache and parallel TTS."""
+    texts = [TEXT_POOL[i % len(TEXT_POOL)] for i in range(count)]
+
+    # Check cache first
+    samples: list[AudioSample | None] = [None] * count
+    cached = 0
+    for i, text in enumerate(texts):
+        sample = _load_cached(text, tts_url)
+        if sample is not None:
+            samples[i] = sample
+            cached += 1
+
+    if cached == count:
+        print(f"  Loaded all {count} samples from cache.")
+        return samples  # type: ignore[return-value]
+
+    if cached > 0:
+        print(f"  Loaded {cached}/{count} from cache, generating {count - cached}...")
+    else:
+        print(f"  Generating {count} audio samples ({max_parallel} parallel)...")
+
+    # Generate missing samples in parallel with a semaphore
+    sem = asyncio.Semaphore(max_parallel)
+    progress = {"done": cached, "total": count}
+
+    async def _gen(idx: int, text: str) -> None:
+        async with sem:
+            sample = await generate_audio(tts_url, text)
+            _save_cached(sample, tts_url)
+            samples[idx] = sample
+            progress["done"] += 1
+            print(f"  [{progress['done']}/{progress['total']}] "
+                  f"{sample.duration:.1f}s audio generated", flush=True)
+
+    tasks = []
+    for i, text in enumerate(texts):
+        if samples[i] is None:
+            tasks.append(_gen(i, text))
+    await asyncio.gather(*tasks)
+
+    return samples  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -466,72 +531,86 @@ def compute_wer(reference: str, hypothesis: str) -> float:
         return -1.0
 
 
+REPORT_HEADER = (
+    f"{'Conc':>4}  "
+    f"{'EOS p50':>8} {'EOS p95':>8} {'EOS mean':>9}  "
+    f"{'Audio Dur':>9}  {'WER%':>6}  "
+    f"{'GPU%p95':>7} {'GPU%mean':>8}  "
+    f"{'VRAM peak':>9} {'VRAM mean':>9}"
+)
+
+
+def compute_entry_row(entry: dict) -> dict | None:
+    """Compute a single result row dict from a benchmark entry."""
+    sessions: list[SessionResult] = entry["sessions"]
+    gpu_stats: dict = entry.get("gpu_stats", {})
+    if not sessions:
+        return None
+
+    eos_lats = [s.eos_latency for s in sessions]
+    audio_dur = statistics.mean(s.audio_duration for s in sessions)
+
+    eos_p50 = percentile(eos_lats, 50)
+    eos_p95 = percentile(eos_lats, 95)
+    eos_mean = statistics.mean(eos_lats)
+
+    wers = [compute_wer(s.reference, s.transcript) for s in sessions]
+    valid_wers = [w for w in wers if w >= 0]
+    wer = statistics.mean(valid_wers) if valid_wers else -1.0
+    wer_pct = wer * 100 if wer >= 0 else -1.0
+
+    return {
+        "concurrency": entry["concurrency"],
+        "eos_p50": round(eos_p50, 4),
+        "eos_p95": round(eos_p95, 4),
+        "eos_mean": round(eos_mean, 4),
+        "audio_duration_s": round(audio_dur, 2),
+        "wer_pct": round(wer_pct, 2),
+        "gpu_util_p95": gpu_stats.get("gpu_util_p95"),
+        "gpu_util_mean": gpu_stats.get("gpu_util_mean"),
+        "vram_peak_mib": gpu_stats.get("vram_peak_mib"),
+        "vram_mean_mib": gpu_stats.get("vram_mean_mib"),
+    }
+
+
+def format_row(row: dict) -> str:
+    """Format a single result row as a table line."""
+    gpu_util_p95 = row["gpu_util_p95"]
+    gpu_util_mean = row["gpu_util_mean"]
+    vram_peak = row["vram_peak_mib"]
+    vram_mean = row["vram_mean_mib"]
+    wer_pct = row["wer_pct"]
+
+    gpu_p95_str = f"{gpu_util_p95:.0f}%" if gpu_util_p95 is not None else "n/a"
+    gpu_mean_str = f"{gpu_util_mean:.0f}%" if gpu_util_mean is not None else "n/a"
+    vram_peak_str = f"{vram_peak} MiB" if vram_peak is not None else "n/a"
+    vram_mean_str = f"{vram_mean:.0f} MiB" if vram_mean is not None else "n/a"
+    wer_str = f"{wer_pct:.2f}%" if wer_pct >= 0 else "n/a"
+
+    return (
+        f"{row['concurrency']:>4}  "
+        f"{row['eos_p50']:>8.4f} {row['eos_p95']:>8.4f} {row['eos_mean']:>9.4f}  "
+        f"{row['audio_duration_s']:>8.2f}s  {wer_str:>6}  "
+        f"{gpu_p95_str:>7} {gpu_mean_str:>8}  "
+        f"{vram_peak_str:>9} {vram_mean_str:>9}"
+    )
+
+
 def print_report(all_results: list[dict]) -> list[dict]:
     """Print a formatted results table and return row dicts for CSV output."""
-    header = (
-        f"{'Conc':>4}  "
-        f"{'EOS p50':>8} {'EOS p95':>8} {'EOS mean':>9}  "
-        f"{'Audio Dur':>9}  {'WER%':>6}  "
-        f"{'GPU%p95':>7} {'GPU%mean':>8}  "
-        f"{'VRAM peak':>9} {'VRAM mean':>9}"
-    )
-    print("\n" + "=" * len(header))
-    print(header)
-    print("-" * len(header))
+    print("\n" + "=" * len(REPORT_HEADER))
+    print(REPORT_HEADER)
+    print("-" * len(REPORT_HEADER))
 
     rows: list[dict] = []
     for entry in all_results:
-        sessions: list[SessionResult] = entry["sessions"]
-        gpu_stats: dict = entry.get("gpu_stats", {})
-        if not sessions:
+        row = compute_entry_row(entry)
+        if row is None:
             continue
-
-        eos_lats = [s.eos_latency for s in sessions]
-        audio_dur = statistics.mean(s.audio_duration for s in sessions)
-
-        eos_p50 = percentile(eos_lats, 50)
-        eos_p95 = percentile(eos_lats, 95)
-        eos_mean = statistics.mean(eos_lats)
-
-        wers = [compute_wer(s.reference, s.transcript) for s in sessions]
-        valid_wers = [w for w in wers if w >= 0]
-        wer = statistics.mean(valid_wers) if valid_wers else -1.0
-        wer_pct = wer * 100 if wer >= 0 else -1.0
-
-        gpu_util_p95 = gpu_stats.get("gpu_util_p95")
-        gpu_util_mean = gpu_stats.get("gpu_util_mean")
-        vram_peak = gpu_stats.get("vram_peak_mib")
-        vram_mean = gpu_stats.get("vram_mean_mib")
-
-        row = {
-            "concurrency": entry["concurrency"],
-            "eos_p50": round(eos_p50, 4),
-            "eos_p95": round(eos_p95, 4),
-            "eos_mean": round(eos_mean, 4),
-            "audio_duration_s": round(audio_dur, 2),
-            "wer_pct": round(wer_pct, 2),
-            "gpu_util_p95": gpu_util_p95,
-            "gpu_util_mean": gpu_util_mean,
-            "vram_peak_mib": vram_peak,
-            "vram_mean_mib": vram_mean,
-        }
         rows.append(row)
+        print(format_row(row))
 
-        gpu_p95_str = f"{gpu_util_p95:.0f}%" if gpu_util_p95 is not None else "n/a"
-        gpu_mean_str = f"{gpu_util_mean:.0f}%" if gpu_util_mean is not None else "n/a"
-        vram_peak_str = f"{vram_peak} MiB" if vram_peak is not None else "n/a"
-        vram_mean_str = f"{vram_mean:.0f} MiB" if vram_mean is not None else "n/a"
-        wer_str = f"{wer_pct:.2f}%" if wer_pct >= 0 else "n/a"
-
-        print(
-            f"{row['concurrency']:>4}  "
-            f"{row['eos_p50']:>8.4f} {row['eos_p95']:>8.4f} {row['eos_mean']:>9.4f}  "
-            f"{row['audio_duration_s']:>8.2f}s  {wer_str:>6}  "
-            f"{gpu_p95_str:>7} {gpu_mean_str:>8}  "
-            f"{vram_peak_str:>9} {vram_mean_str:>9}"
-        )
-
-    print("=" * len(header))
+    print("=" * len(REPORT_HEADER))
     return rows
 
 
@@ -685,8 +764,14 @@ async def main() -> None:
     gpu_monitor = GpuMonitor(gpu_id)
     await gpu_monitor.start()
 
+    # Print table header once
+    print("\n" + "=" * len(REPORT_HEADER))
+    print(REPORT_HEADER)
+    print("-" * len(REPORT_HEADER))
+
     all_results: list[dict] = []
-    for concurrency in concurrency_levels:
+    rows: list[dict] = []
+    for i, concurrency in enumerate(concurrency_levels):
         gpu_mark = gpu_monitor.mark()
         sessions = await run_benchmark(
             stt_url=args.stt_url,
@@ -695,16 +780,26 @@ async def main() -> None:
             timeout=args.timeout,
         )
         gpu_stats = gpu_monitor.slice_stats(gpu_mark)
-        all_results.append({
+        entry = {
             "concurrency": concurrency,
             "sessions": sessions,
             "gpu_stats": gpu_stats,
-        })
-        await asyncio.sleep(3.0)  # let GPU settle between levels
+        }
+        all_results.append(entry)
+
+        # Print this level's results immediately
+        row = compute_entry_row(entry)
+        if row is not None:
+            rows.append(row)
+            print(format_row(row), flush=True)
+
+        if i < len(concurrency_levels) - 1:
+            await asyncio.sleep(2.0)  # brief settle between levels
+
+    print("=" * len(REPORT_HEADER))
 
     await gpu_monitor.stop()
 
-    rows = print_report(all_results)
     write_csv(rows, args.output)
 
 
