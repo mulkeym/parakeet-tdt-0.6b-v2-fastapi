@@ -357,14 +357,13 @@ async def run_benchmark(
     stt_url: str,
     samples: list[AudioSample],
     concurrency: int,
-    mode: str,
     timeout: float,
 ) -> list[SessionResult]:
     """Run *concurrency* parallel STT sessions, each with a unique audio sample."""
-    print(f"\n  Concurrency={concurrency}, mode={mode}...", end=" ", flush=True)
+    print(f"\n  Concurrency={concurrency}...", end=" ", flush=True)
 
     tasks = [
-        run_session(stt_url, samples[i % len(samples)], mode, timeout, session_id=i)
+        run_session(stt_url, samples[i % len(samples)], timeout, session_id=i)
         for i in range(concurrency)
     ]
     outcomes = await asyncio.gather(*tasks, return_exceptions=True)
