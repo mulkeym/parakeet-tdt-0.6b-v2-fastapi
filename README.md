@@ -193,7 +193,7 @@ ws.onmessage = evt => {
 
 ## Benchmarking
 
-`benchmark_stt.py` is a WebSocket load-testing tool that measures latency, throughput, and accuracy of the STT service under concurrent load. It uses a TTS service (e.g. Chatterbox) to generate test audio, streams it over WebSocket connections, and reports metrics.
+`benchmark_stt.py` is a realtime streaming concurrency benchmark for the STT service. It generates test audio via a TTS service, streams it over concurrent WebSocket connections at real-time pace, and measures EOS latency, GPU utilization, VRAM usage, and word error rate as concurrency scales up.
 
 ### Prerequisites
 
@@ -203,7 +203,7 @@ Install the additional benchmark dependencies:
 pip install httpx soundfile websockets jiwer
 ```
 
-A running TTS service is needed to generate test audio (the benchmark calls it to synthesize speech from text).
+A running TTS service is needed to generate test audio. `nvidia-smi` must be available on the benchmark host for GPU metrics (metrics are skipped gracefully if unavailable). The benchmark auto-detects which GPU is running the parakeet process.
 
 ### Quick Start
 
@@ -211,15 +211,14 @@ A running TTS service is needed to generate test audio (the benchmark calls it t
 # Single diagnostic session (check connectivity and see raw messages)
 python benchmark_stt.py --probe
 
-# Default benchmark: concurrency 1,2,3,5,7,10 in realtime and fast modes
+# Default benchmark: ramp concurrency 1 -> 5 -> 10 -> 20 -> 30 -> 40
 python benchmark_stt.py
 
 # Custom run
 python benchmark_stt.py \
   --stt-url ws://localhost:8000/ws \
   --tts-url http://localhost:8004/tts \
-  --concurrency 1,4,8 \
-  --modes realtime \
+  --concurrency 1,5,10,20 \
   --output results.csv
 ```
 
@@ -227,27 +226,28 @@ python benchmark_stt.py \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--stt-url` | `ws://192.168.1.181:81/ws` | WebSocket URL of the STT service |
-| `--tts-url` | `http://192.168.1.181:8004/tts` | HTTP URL of the TTS service used to generate test audio |
-| `--concurrency` | `1,2,3,5,7,10` | Comma-separated concurrency levels to test |
-| `--modes` | `realtime,fast` | Send modes: `realtime` (paced at audio speed) or `fast` (as fast as possible) |
+| `--stt-url` | `ws://localhost:8000/ws` | WebSocket URL of the STT service |
+| `--tts-url` | `http://localhost:8004/tts` | HTTP URL of the TTS service used to generate test audio |
+| `--concurrency` | `1,5,10,20,30,40` | Comma-separated concurrency levels to ramp through |
 | `--output` | `benchmark_results.csv` | Output CSV file path |
 | `--timeout` | `30.0` | Seconds to wait for transcription results before giving up |
 | `--probe` | off | Run a single verbose diagnostic session, then exit |
-
-### Send Modes
-
-- **`realtime`** - Sends audio frames paced at real-time speed (100ms per chunk). Simulates a live microphone stream.
-- **`fast`** - Sends frames as fast as the connection allows. Useful for measuring raw throughput and worst-case batching behavior.
 
 ### Reported Metrics
 
 | Metric | Description |
 |--------|-------------|
-| TTFB p50/p95/mean | Time to first transcription result (seconds) |
-| Total p50/p95/mean | Wall-clock time from first send to last result |
-| RTF | Real-time factor (processing time / audio duration). Below 1.0 = faster than real-time |
-| WER | Word error rate vs. the known reference text. Computed with order-independent sentence matching to handle batched results arriving out of order |
+| EOS Latency (p50/p95/mean) | End-of-speech latency: time from last audio frame sent to final transcript received. This is what a voice agent user feels as "waiting for the system to understand." |
+| Audio Duration | Average length of the test speech clips (seconds) |
+| WER% | Word error rate as a percentage vs. the known reference text |
+| GPU% (p95/mean) | GPU SM utilization during the concurrency level (sampled at 1Hz via `nvidia-smi dmon`) |
+| VRAM (peak/mean) | GPU memory usage in MiB during the concurrency level |
+
+### GPU Monitoring
+
+The benchmark automatically detects which GPU is running the parakeet service by inspecting `nvidia-smi` process listings. It then spawns `nvidia-smi dmon` in the background to sample GPU utilization and VRAM at 1-second intervals. Per-concurrency-level stats (p95/mean for utilization, peak/mean for VRAM) are computed from samples collected during that level's run.
+
+If `nvidia-smi` is not available, GPU columns show `n/a` and the benchmark continues without GPU metrics.
 
 ### Probe Mode
 
