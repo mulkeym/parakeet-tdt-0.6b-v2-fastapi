@@ -44,6 +44,17 @@ async def lifespan(app):
     torch.cuda.empty_cache()
     logger.info("Memory cleanup complete")
 
+    # Enable per-word confidence scoring
+    with open_dict(model.cfg.decoding):
+        model.cfg.decoding.confidence_cfg = {
+            "preserve_word_confidence": True,
+            "preserve_token_confidence": False,
+            "preserve_frame_confidence": False,
+            "method_cfg": {"name": "max_prob"},
+        }
+    model.change_decoding_strategy(model.cfg.decoding)
+    logger.info("Enabled word-level confidence scoring")
+
     app.state.asr_model = model
     logger.info("Model ready on %s", next(model.parameters()).device)
 

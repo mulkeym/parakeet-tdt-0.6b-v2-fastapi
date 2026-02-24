@@ -1,71 +1,100 @@
-import asyncio, contextlib, logging, tempfile, pathlib, time, torch
-from typing import Union, List
+import asyncio
+import logging
+import time
+import torch
+import numpy as np
+from typing import List, Tuple
 
-from parakeet_service import model as mdl
+from parakeet_service.config import BATCH_SIZE, BATCH_WINDOW_MS
 
 logger = logging.getLogger("batcher")
 logger.setLevel(logging.DEBUG)
 
 # -------- shared state -------------------------------------------------------
-transcription_queue: asyncio.Queue[str | bytes] = asyncio.Queue()
+# Queue items are (chunk_id, audio_array) tuples
+transcription_queue: asyncio.Queue[Tuple[str, np.ndarray]] = asyncio.Queue(maxsize=64)
 condition = asyncio.Condition()          # wakes websocket consumers
-results: dict[str, str] = {}             # path -> text
+results: dict[str, dict] = {}             # chunk_id -> {"text": ..., "confidence": ..., "words": ...}
 
-# -------- helper -------------------------------------------------------------
-def _as_path(blob: Union[str, bytes]) -> str:
-    """Ensures we always hand a *file path* to NeMo."""
-    if isinstance(blob, str):
-        return blob
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    tmp.write(blob)
-    tmp.close()
-    return tmp.name
+
+# -------- sync inference (runs in thread pool) -------------------------------
+def _run_inference(model, audio_arrays: List[np.ndarray], batch_size: int):
+    """Run NeMo transcribe on a list of numpy arrays. Called via asyncio.to_thread()."""
+    with torch.inference_mode():
+        return model.transcribe(
+            audio_arrays, batch_size=batch_size,
+            return_hypotheses=True, verbose=False,
+        )
+
+
+def _extract_result(hypothesis) -> dict:
+    """Extract text, confidence, and per-word scores from a Hypothesis object."""
+    text = getattr(hypothesis, "text", "") or ""
+    word_conf = getattr(hypothesis, "word_confidence", None)
+
+    if word_conf:
+        word_scores = [round(float(c), 4) for c in word_conf]
+        confidence = round(sum(word_scores) / len(word_scores), 4)
+    else:
+        word_scores = None
+        confidence = None
+
+    return {"text": text, "confidence": confidence, "words": word_scores}
+
 
 # -------- main worker --------------------------------------------------------
-async def batch_worker(model, batch_ms: float = 15.0, max_batch: int = 4):
-    """Forever drain `transcription_queue` → ASR → `results`."""
-    logger.info("worker started (batch ≤%d, window %.0f ms)", max_batch, batch_ms)
-    logger.info("worker started with model id=%s", id(model))
-    
+async def batch_worker(model, batch_ms: float = None, max_batch: int = None):
+    """Forever drain `transcription_queue` -> ASR -> `results`.
+
+    Inference runs in a thread pool so the asyncio event loop stays responsive.
+    """
+    if batch_ms is None:
+        batch_ms = float(BATCH_WINDOW_MS)
+    if max_batch is None:
+        max_batch = BATCH_SIZE
+
+    logger.info("worker started (batch <=%d, window %.0f ms, model id=%s)",
+                max_batch, batch_ms, id(model))
 
     while True:
-        path = await transcription_queue.get()      # blocks until 1st item
-        batch: List[str] = [_as_path(path)]
+        # Block until at least one item arrives
+        first_item = await transcription_queue.get()
+        batch: List[Tuple[str, np.ndarray]] = [first_item]
 
         # ---------- micro-batch gathering with timeout ----------
         deadline = time.monotonic() + batch_ms / 1000
         while len(batch) < max_batch:
-            timeout = deadline - time.monotonic()
-            if timeout <= 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
             try:
-                nxt = await asyncio.wait_for(transcription_queue.get(), timeout)
-                batch.append(_as_path(nxt))
+                nxt = await asyncio.wait_for(transcription_queue.get(), remaining)
+                batch.append(nxt)
             except asyncio.TimeoutError:
                 break
 
-        logger.debug("processing %d-file batch", len(batch))
+        chunk_ids = [item[0] for item in batch]
+        audio_arrays = [item[1] for item in batch]
 
-        # ---------- inference ----------
+        logger.debug("processing %d-item batch", len(batch))
+
+        # ---------- inference (in thread pool) ----------
         try:
-            with torch.inference_mode():
-                outs = model.transcribe(
-                    batch, batch_size=len(batch)
-                )                                       # NeMo API
+            outs = await asyncio.to_thread(
+                _run_inference, model, audio_arrays, len(audio_arrays)
+            )
         except Exception as exc:
             logger.exception("ASR failed: %s", exc)
-            for _ in batch:
+            for cid, _ in batch:
+                results[cid] = {"text": "", "confidence": None, "words": None}
                 transcription_queue.task_done()
+            async with condition:
+                condition.notify_all()
             continue
 
         # ---------- store results & notify ----------
-        for p, h in zip(batch, outs):
-            results[p] = getattr(h, "text", str(h))
-            transcription_queue.task_done()            # mark done
+        for cid, h in zip(chunk_ids, outs):
+            results[cid] = _extract_result(h)
+            transcription_queue.task_done()
         async with condition:
             condition.notify_all()
-
-        # ---------- cleanup ----------
-        for p in batch:
-            with contextlib.suppress(FileNotFoundError):
-                pathlib.Path(p).unlink(missing_ok=True)
