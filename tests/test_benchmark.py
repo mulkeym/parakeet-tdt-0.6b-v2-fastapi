@@ -62,3 +62,11 @@ class TestGpuStats:
         assert stats["gpu_util_p95"] == 75.0
         assert stats["vram_peak_mib"] == 3000
         assert stats["vram_mean_mib"] == 3000.0
+
+
+class TestSessionResult:
+    def test_fields_exist(self):
+        from benchmark_stt import SessionResult
+        r = SessionResult(eos_latency=0.5, audio_duration=6.0, transcript="hello", reference="hello")
+        assert r.eos_latency == 0.5
+        assert r.audio_duration == 6.0

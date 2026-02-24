@@ -216,10 +216,10 @@ class AudioSample:
 
 @dataclass
 class SessionResult:
-    ttfb: float  # time to first byte (seconds)
-    total_time: float  # wall-clock duration of the session (seconds)
-    transcript: str  # concatenated transcription text
-    reference: str  # the reference text this session was given
+    eos_latency: float      # time from end-of-speech to final transcript (seconds)
+    audio_duration: float   # duration of the audio clip (seconds)
+    transcript: str         # concatenated transcription text
+    reference: str          # the reference text this session was given
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +279,6 @@ async def generate_audio_pool(
 async def run_session(
     stt_url: str,
     sample: AudioSample,
-    mode: str,
     timeout: float,
     session_id: int,
 ) -> SessionResult:
@@ -293,41 +292,31 @@ async def run_session(
     for offset in range(0, total_samples, FRAME_SAMPLES):
         frame = pcm_int16[offset : offset + FRAME_SAMPLES]
         if len(frame) < FRAME_SAMPLES:
-            # Pad the last frame with silence
             frame = np.pad(frame, (0, FRAME_SAMPLES - len(frame)))
         frames.append(frame.tobytes())
 
     silence_frame = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
     texts: list[str] = []
-    first_text_time: float | None = None
     last_text_time: float | None = None
     sending_done = asyncio.Event()
 
     async with websockets.connect(stt_url, ping_interval=None, ping_timeout=None) as ws:
-        start_time = time.monotonic()
 
         async def receiver():
-            nonlocal first_text_time, last_text_time
+            nonlocal last_text_time
             try:
                 while True:
-                    # While still sending audio, use full timeout (realtime
-                    # streams take a long time and VAD flushes are spaced apart).
-                    # After sending finishes, use a shorter timeout to detect
-                    # when no more results are coming.
                     if not sending_done.is_set():
                         wait_seconds = timeout
-                    elif first_text_time is None:
-                        wait_seconds = timeout
-                    else:
+                    elif last_text_time is not None:
                         wait_seconds = 5.0
+                    else:
+                        wait_seconds = timeout
                     raw = await asyncio.wait_for(ws.recv(), timeout=wait_seconds)
                     msg = json.loads(raw)
 
                     if "text" in msg and msg["text"].strip():
-                        now = time.monotonic()
-                        if first_text_time is None:
-                            first_text_time = now
-                        last_text_time = now
+                        last_text_time = time.monotonic()
                         texts.append(msg["text"])
             except asyncio.TimeoutError:
                 pass
@@ -336,32 +325,28 @@ async def run_session(
 
         recv_task = asyncio.create_task(receiver())
 
-        # Send audio frames
-        for i, frame in enumerate(frames):
+        # Send audio frames at realtime pace
+        for frame in frames:
             await ws.send(frame)
-            if mode == "realtime":
-                await asyncio.sleep(FRAME_DURATION)
-            elif mode == "fast" and (i + 1) % 50 == 0:
-                await asyncio.sleep(0)  # yield to event loop
+            await asyncio.sleep(FRAME_DURATION)
 
         # Send trailing silence to flush VAD
         for _ in range(SILENCE_PADDING_FRAMES):
             await ws.send(silence_frame)
-            if mode == "realtime":
-                await asyncio.sleep(FRAME_DURATION)
-            elif mode == "fast":
-                await asyncio.sleep(0)
+            await asyncio.sleep(FRAME_DURATION)
 
+        eos_time = time.monotonic()
         sending_done.set()
         await recv_task
 
-    ttfb = (first_text_time - start_time) if first_text_time is not None else timeout
-    total_time = (last_text_time - start_time) if last_text_time is not None else timeout
+    eos_latency = (last_text_time - eos_time) if last_text_time is not None else timeout
     transcript = " ".join(texts)
 
     return SessionResult(
-        ttfb=ttfb, total_time=total_time,
-        transcript=transcript, reference=sample.text,
+        eos_latency=eos_latency,
+        audio_duration=sample.duration,
+        transcript=transcript,
+        reference=sample.text,
     )
 
 
