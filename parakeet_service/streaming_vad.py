@@ -2,9 +2,8 @@ from __future__ import annotations
 import itertools
 import numpy as np
 from typing import List, Tuple
-from torch.hub import load as torch_hub_load
+from parakeet_service.vad import vad_model, vad_utils
 
-vad_model, vad_utils = torch_hub_load("snakers4/silero-vad", "silero_vad")
 (_, _, _, VADIterator, _) = vad_utils
 
 # TODO: Update to read from .env

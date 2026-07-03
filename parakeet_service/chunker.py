@@ -19,10 +19,9 @@ from typing import List
 import soundfile as sf
 
 
-from torch.hub import load as torch_hub_load
+from parakeet_service.vad import vad_model, vad_utils
 
-vad_model, vad_utils = torch_hub_load("snakers4/silero-vad", "silero_vad")
-get_speech_ts, _, _, VADIterator, _ = vad_utils 
+get_speech_ts, _, _, VADIterator, _ = vad_utils
 
 SAMPLE_RATE        = 16_000
 TARGET_SEC         = 60

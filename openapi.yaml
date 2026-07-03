@@ -17,6 +17,56 @@ paths:
           content:
             application/json:
               schema: {}
+  /v1/audio/transcriptions:
+    post:
+      tags:
+      - speech
+      summary: Transcribe an audio file
+      operationId: transcribe_audio_v1_audio_transcriptions_post
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_transcribe_audio_v1_audio_transcriptions_post'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TranscriptionResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /audio/transcriptions:
+    post:
+      tags:
+      - speech
+      summary: Transcribe an audio file
+      operationId: transcribe_audio_audio_transcriptions_post
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_transcribe_audio_audio_transcriptions_post'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TranscriptionResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /transcribe:
     post:
       tags:
@@ -42,20 +92,29 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-  /debug/cfg:
-    get:
-      tags:
-      - speech
-      summary: Show Cfg
-      operationId: show_cfg_debug_cfg_get
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema: {}
 components:
   schemas:
+    Body_transcribe_audio_audio_transcriptions_post:
+      properties:
+        file:
+          type: string
+          format: binary
+          title: File
+        include_timestamps:
+          type: boolean
+          title: Include Timestamps
+          description: Return char/word/segment offsets
+          default: false
+        should_chunk:
+          type: boolean
+          title: Should Chunk
+          description: If true (default), split long audio into ~60s VAD-aligned chunks
+            for batching
+          default: true
+      type: object
+      required:
+      - file
+      title: Body_transcribe_audio_audio_transcriptions_post
     Body_transcribe_audio_transcribe_post:
       properties:
         file:
@@ -77,6 +136,27 @@ components:
       required:
       - file
       title: Body_transcribe_audio_transcribe_post
+    Body_transcribe_audio_v1_audio_transcriptions_post:
+      properties:
+        file:
+          type: string
+          format: binary
+          title: File
+        include_timestamps:
+          type: boolean
+          title: Include Timestamps
+          description: Return char/word/segment offsets
+          default: false
+        should_chunk:
+          type: boolean
+          title: Should Chunk
+          description: If true (default), split long audio into ~60s VAD-aligned chunks
+            for batching
+          default: true
+      type: object
+      required:
+      - file
+      title: Body_transcribe_audio_v1_audio_transcriptions_post
     HTTPValidationError:
       properties:
         detail:
@@ -94,8 +174,7 @@ components:
           description: Plain transcription.
         timestamps:
           anyOf:
-          - additionalProperties: true
-            type: object
+          - type: object
           - type: 'null'
           title: Timestamps
           description: Word/segment/char offsets (see NeMo docs).

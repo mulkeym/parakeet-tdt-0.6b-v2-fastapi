@@ -33,7 +33,9 @@ This fork includes several improvements to the WebSocket streaming pipeline:
 
 - **Production-ready deployment**
   - Docker and Docker Compose support
-  - Health checks and configuration endpoints
+  - Health check endpoint and non-root, air-gapped container
+  - Optional API-key authentication
+  - Configurable model/component sources (Artifactory-friendly)
   - Environment variable configuration
 
 - **Audio preprocessing**
@@ -45,6 +47,8 @@ This fork includes several improvements to the WebSocket streaming pipeline:
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Model Sources (Artifactory / Air-Gapped)](#model-sources-artifactory--air-gapped)
+- [Authentication](#authentication)
 - [Running the Server](#running-the-server)
 - [Usage](#usage)
   - [REST API](#rest-api)
@@ -98,14 +102,114 @@ BATCH_SIZE=16
 BATCH_WINDOW_MS=100
 
 # Audio processing
-TARGET_SAMPLE_RATE=16000
-MAX_AUDIO_DURATION=30
+TARGET_SR=16000
+MAX_AUDIO_DURATION=3600
 VAD_THRESHOLD=0.5
+
+# Security / DoS limits
+API_KEY=                       # unset = open; set = required on all endpoints
+MAX_UPLOAD_BYTES=104857600     # 100 MiB upload cap
 
 # System
 LOG_LEVEL=INFO
 PROCESSING_TIMEOUT=60
 ```
+
+See [`.env.example`](.env.example) for the full annotated list.
+
+## Model Sources (Artifactory / Air-Gapped)
+
+The ASR model and Silero VAD are **pre-baked into the image at build time** so the
+runtime container is fully self-contained — it makes no calls to Hugging Face, NGC,
+or GitHub at startup (`HF_HUB_OFFLINE=1` is enforced). Where those artifacts are
+pulled *from* during the build is configurable, so you can source everything from
+an internal Artifactory.
+
+The ASR model source is controlled by `MODEL_SOURCE`, which accepts three forms.
+The two Artifactory-friendly methods are documented below.
+
+### Method 1 — Direct `.nemo` artifact (Artifactory generic repo)
+
+Point `MODEL_SOURCE` at an `http(s)` URL of a `.nemo` file. It is downloaded once
+into `MODEL_CACHE_DIR` and loaded via NeMo's `restore_from`. Supply an optional
+bearer token for authenticated repos via a BuildKit secret (kept out of image
+layers and history).
+
+```bash
+export MODEL_SOURCE_TOKEN="<artifactory-access-token>"
+
+DOCKER_BUILDKIT=1 docker build \
+  --secret id=model_source_token,env=MODEL_SOURCE_TOKEN \
+  --build-arg MODEL_SOURCE=https://artifactory.example.com/artifactory/models/parakeet-tdt-0.6b-v2.nemo \
+  --build-arg PIP_INDEX_URL=https://artifactory.example.com/artifactory/api/pypi/pypi-remote/simple \
+  --build-arg TORCH_INDEX_URL=https://artifactory.example.com/artifactory/api/pypi/pytorch-remote/simple \
+  -t parakeet-stt .
+```
+
+`MODEL_SOURCE` is baked into the image so the runtime resolves the same cached
+artifact. A local `.nemo` path also works (`MODEL_SOURCE=/opt/models/asr/model.nemo`)
+if you mount or copy the file in yourself.
+
+### Method 2 — Hugging Face remote proxy (repo id + `HF_ENDPOINT`)
+
+Keep `MODEL_SOURCE` as the repo id and route `from_pretrained` through an
+Artifactory HuggingFace-remote repository by setting `HF_ENDPOINT`:
+
+```bash
+DOCKER_BUILDKIT=1 docker build \
+  --build-arg MODEL_SOURCE=nvidia/parakeet-tdt-0.6b-v2 \
+  --build-arg HF_ENDPOINT=https://artifactory.example.com/artifactory/api/huggingfaceml/hf-remote \
+  --build-arg PIP_INDEX_URL=https://artifactory.example.com/artifactory/api/pypi/pypi-remote/simple \
+  --build-arg TORCH_INDEX_URL=https://artifactory.example.com/artifactory/api/pypi/pytorch-remote/simple \
+  -t parakeet-stt .
+```
+
+### Components (pip / torch wheels)
+
+Independently of the model, redirect Python packages to Artifactory PyPI mirrors
+with the `PIP_INDEX_URL` / `PIP_EXTRA_INDEX_URL` / `TORCH_INDEX_URL` build args
+(shown above). These are **build-time only**.
+
+### Silero VAD
+
+Defaults to the `snakers4/silero-vad` torch.hub repo (cached at build). To load a
+vendored copy from a directory instead, set `VAD_SOURCE_TYPE=local` and
+`VAD_SOURCE=/path/to/vendored/silero-vad` (the directory must be present in the
+image).
+
+### `docker compose`
+
+The same knobs are exposed as environment variables consumed by
+`docker-compose.yaml` (both `build.args` and runtime `environment`):
+
+```bash
+export MODEL_SOURCE=https://artifactory.example.com/artifactory/models/parakeet-tdt-0.6b-v2.nemo
+export PIP_INDEX_URL=https://artifactory.example.com/artifactory/api/pypi/pypi-remote/simple
+export TORCH_INDEX_URL=https://artifactory.example.com/artifactory/api/pypi/pytorch-remote/simple
+docker compose up --build -d
+```
+
+## Authentication
+
+Authentication is **optional and off by default**. If `API_KEY` is unset or empty,
+the service is open. If `API_KEY` is set, every REST request and WebSocket
+connection must present the matching key; `/healthz` remains open for probes.
+
+Clients present the key one of these ways:
+
+```bash
+# Header (default header name; override with API_KEY_HEADER)
+curl -H "x-api-key: $API_KEY" ...
+# or a bearer token
+curl -H "Authorization: Bearer $API_KEY" ...
+```
+
+For the WebSocket, browser clients that cannot set headers may pass it as a query
+parameter: `ws://host:8000/ws?api_key=<key>`. Invalid/missing keys receive `401`
+(REST) or a `1008` policy-violation close (WebSocket).
+
+> For the full hardening posture (container, supply chain, DoS limits, deployment
+> assumptions) see [`SECURITY.md`](SECURITY.md).
 
 ## Running the Server
 
@@ -338,11 +442,25 @@ H --> A
 | `DEVICE` | cuda | Computation device |
 | `BATCH_SIZE` | 16 | Processing batch size |
 | `BATCH_WINDOW_MS` | 100 | Micro-batch collection window in milliseconds |
-| `TARGET_SAMPLE_RATE` | 16000 | Target sample rate |
-| `MAX_AUDIO_DURATION` | 30 | Max audio length in seconds |
+| `TARGET_SR` | 16000 | Target sample rate |
+| `MAX_AUDIO_DURATION` | 3600 | Max decoded audio length in seconds (hard ceiling) |
 | `VAD_THRESHOLD` | 0.5 | Voice activity threshold |
 | `LOG_LEVEL` | INFO | Logging verbosity |
-| `PROCESSING_TIMEOUT` | 60 | Processing timeout in seconds |
+| `PROCESSING_TIMEOUT` | 60 | ffmpeg/transcode timeout in seconds |
+| **Security** | | |
+| `API_KEY` | _(unset)_ | If set, required on all endpoints (see [Authentication](#authentication)) |
+| `API_KEY_HEADER` | x-api-key | Header name clients use to send the key |
+| `MAX_UPLOAD_BYTES` | 104857600 | Reject uploads larger than this (100 MiB) |
+| **Model sources** | | |
+| `MODEL_SOURCE` | nvidia/parakeet-tdt-0.6b-v2 | Repo id, local `.nemo` path, or `http(s)` URL to a `.nemo` |
+| `MODEL_CACHE_DIR` | /opt/models/asr | Cache dir for downloaded `.nemo` artifacts |
+| `MODEL_SOURCE_TOKEN` | _(unset)_ | Optional bearer token for the `MODEL_SOURCE` download |
+| `HF_ENDPOINT` | _(unset)_ | Hugging Face endpoint override (Artifactory HF proxy) |
+| `VAD_SOURCE` | snakers4/silero-vad | torch.hub repo id or vendored local dir |
+| `VAD_SOURCE_TYPE` | github | `github` or `local` |
+
+> Build-time only (docker build args): `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`,
+> `TORCH_INDEX_URL` — see [Model Sources](#model-sources-artifactory--air-gapped).
 
 ## Contributing
 

@@ -1,14 +1,40 @@
 services:
   parakeet:
-    build: .
+    build:
+      context: .
+      # Point pip, torch wheels, and the models at your Artifactory by setting
+      # these in the environment (or an .env file) before `docker compose build`.
+      args:
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.org/simple}"
+        PIP_EXTRA_INDEX_URL: "${PIP_EXTRA_INDEX_URL:-}"
+        TORCH_INDEX_URL: "${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
+        HF_ENDPOINT: "${HF_ENDPOINT:-}"
+        MODEL_SOURCE: "${MODEL_SOURCE:-nvidia/parakeet-tdt-0.6b-v2}"
+        VAD_SOURCE: "${VAD_SOURCE:-snakers4/silero-vad}"
+        VAD_SOURCE_TYPE: "${VAD_SOURCE_TYPE:-github}"
     container_name: parakeet-stt
     ports:
       - "8000:8000"
-    # env_file: .env               # TODO
     environment:
       LOG_LEVEL: "INFO"
-    volumes:
-      - ./data/cache:/root/.cache
+      # Optional API key. If unset, the service is open (no auth required).
+      # Set it (e.g. via an .env file or secret) to require callers to present
+      # `x-api-key: <key>` or `Authorization: Bearer <key>`.
+      API_KEY: "${API_KEY:-}"
+      # Must match the build-time source so runtime resolves the pre-baked cache.
+      MODEL_SOURCE: "${MODEL_SOURCE:-nvidia/parakeet-tdt-0.6b-v2}"
+      HF_ENDPOINT: "${HF_ENDPOINT:-}"
+      VAD_SOURCE: "${VAD_SOURCE:-snakers4/silero-vad}"
+      VAD_SOURCE_TYPE: "${VAD_SOURCE_TYPE:-github}"
+    # Models are baked into the image at build time; no cache volume is needed
+    # and the container runs fully air-gapped as a non-root user.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     # deploy:
     #   resources:
     #     limits:
