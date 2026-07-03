@@ -1,0 +1,15 @@
+# hadolint configuration — https://github.com/hadolint/hadolint
+#
+# Fail the pipeline on any warning or above so Dockerfile regressions are caught.
+failure-threshold: warning
+
+ignored:
+  # DL3008: "Pin versions in apt-get install". The base image is pinned to a
+  # specific patch tag (python:3.11.9-slim-bookworm), so the apt package set is
+  # already reproducible for that image. Pinning individual apt versions would
+  # break on every upstream Debian point-release refresh. Accepted risk.
+  - DL3008
+
+trustedRegistries:
+  - docker.io
+  - registry.gitlab.com

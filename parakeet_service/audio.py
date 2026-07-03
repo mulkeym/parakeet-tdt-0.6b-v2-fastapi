@@ -101,11 +101,24 @@ def ensure_mono_16k(src: Path) -> Tuple[Path, Path]:
             with sf.SoundFile(src) as snd:
                 if snd.samplerate == 16000 and snd.channels == 1:
                     return src, src
-        except:
-            pass
+        except Exception as exc:  # noqa: BLE001 - fall through to full conversion
+            logger.debug("WAV fast-path probe failed for %s: %s", src, exc)
     
     # Use streaming conversion for other cases
     return convert_audio_streaming(src)
+
+
+def probe_duration(src: Path) -> float:
+    """Return audio duration in seconds without loading samples into memory."""
+    try:
+        with sf.SoundFile(src) as snd:
+            return len(snd) / float(snd.samplerate)
+    except Exception as exc:  # noqa: BLE001 - treat unreadable audio as invalid
+        logger.warning("Could not probe duration for %s: %s", src, exc)
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Invalid or unreadable audio file",
+        ) from exc
 
 
 def schedule_cleanup(tasks: BackgroundTasks, *paths: Path) -> None:

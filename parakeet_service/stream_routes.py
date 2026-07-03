@@ -1,9 +1,10 @@
 import logging
 import time
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from parakeet_service.streaming_vad import StreamingVAD
 from parakeet_service.batchworker import transcription_queue, condition, results
+from parakeet_service.auth import websocket_authorized
 import asyncio
 
 logger = logging.getLogger("stream_routes")
@@ -17,6 +18,12 @@ _ws_counter = 0
 @router.websocket("/ws")
 async def ws_asr(ws: WebSocket):
     global _ws_counter
+
+    # Enforce the optional API key before accepting the connection.
+    if not await websocket_authorized(ws):
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     _ws_counter += 1
     ws_id = _ws_counter
 

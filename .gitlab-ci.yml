@@ -1,0 +1,16 @@
+# GitLab CI pipeline.
+#
+# The `lint:dockerfile` job runs hadolint against the Dockerfile and fails the
+# pipeline on any finding at or above the configured threshold (.hadolint.yaml).
+
+stages:
+  - lint
+
+lint:dockerfile:
+  stage: lint
+  image: hadolint/hadolint:latest-debian
+  script:
+    - hadolint --config .hadolint.yaml Dockerfile
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'

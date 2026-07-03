@@ -1,18 +1,31 @@
-fastapi
-uvicorn
-numpy
-torch
-torchaudio
-pydantic
-omegaconf
-pytest
-python-multipart
-ffmpeg-python
-python-dotenv
+# Pinned dependency baseline for reproducible, auditable builds.
+#
+# NOTE for hardened deployments: these are exact-version pins to remove the
+# "unpinned dependency" supply-chain risk. Before production, reconcile the
+# versions against your organisation's vetted internal mirror and generate a
+# fully hash-locked file, e.g.:
+#     pip-compile --generate-hashes --output-file requirements.lock requirements.txt
+# then install with `pip install --require-hashes -r requirements.lock`.
+#
+# torch / torchaudio are installed separately in the Dockerfile from the CUDA
+# wheel index and are pinned there (2.7.0).
 
-# Benchmark dependencies (benchmark_stt.py)
-httpx
-soundfile
-websockets
-rich
-jiwer
+# --- Runtime -----------------------------------------------------------------
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+python-multipart==0.0.20
+python-dotenv==1.0.1
+omegaconf==2.3.0
+numpy==1.26.4
+soundfile==0.12.1
+librosa==0.10.2.post1
+ffmpeg-python==0.2.0
+nemo_toolkit[asr]==2.2.1
+
+# --- Benchmark / dev (benchmark_stt.py, tests) -------------------------------
+httpx==0.28.1
+websockets==14.1
+rich==13.9.4
+jiwer==3.0.5
+pytest==8.3.4
