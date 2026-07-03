@@ -61,6 +61,18 @@ API_KEY_HEADER = os.getenv("API_KEY_HEADER", "x-api-key")
 # Maximum accepted upload size in bytes (default 100 MiB). Guards disk/GPU DoS.
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
 
+# Serve the browser demo dashboard at GET / and /static/*. Set to 0/false to
+# drop that surface entirely in locked-down deployments.
+SERVE_DASHBOARD = os.getenv("SERVE_DASHBOARD", "1").lower() not in ("0", "false", "no")
+
+# Optional WebSocket Origin allowlist (comma-separated, e.g.
+# "https://stt.example.com,https://app.example.com"). When set, browser
+# connections whose Origin is not listed are rejected (defense against
+# cross-site WebSocket hijacking). Unset = no Origin check (non-browser clients
+# send no Origin header and are unaffected).
+_origins = os.getenv("ALLOWED_WS_ORIGINS", "").strip()
+ALLOWED_WS_ORIGINS = {o.strip() for o in _origins.split(",") if o.strip()} or None
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,

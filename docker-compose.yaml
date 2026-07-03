@@ -17,6 +17,11 @@ services:
       - "8000:8000"
     environment:
       LOG_LEVEL: "INFO"
+      # HTTPS is OFF by default (plain HTTP) — intended for API access behind a
+      # TLS-terminating gateway/ingress in production. For a one-off local demo
+      # that needs the browser microphone, run: `ENABLE_TLS=1 docker compose up`
+      # (a self-signed cert is generated at startup) and open https://host:8000/.
+      ENABLE_TLS: "${ENABLE_TLS:-}"
       # Optional API key. If unset, the service is open (no auth required).
       # Set it (e.g. via an .env file or secret) to require callers to present
       # `x-api-key: <key>` or `Authorization: Bearer <key>`.

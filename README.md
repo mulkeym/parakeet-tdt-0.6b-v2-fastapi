@@ -295,6 +295,52 @@ ws.onmessage = evt => {
 };
 ```
 
+## Live Demo Dashboard
+
+The service serves a built-in demo page at the root URL (`GET /`) that captures
+your microphone in the browser, streams it to the `/ws` endpoint, and renders the
+transcription live.
+
+```
+http://localhost:8000/          # on the server itself
+```
+
+### HTTP by default; HTTPS is an opt-in toggle
+
+The service runs **plain HTTP by default** — the intended mode for API access
+in production, where a Kubernetes ingress (or other gateway) terminates TLS in
+front of it. Leave things as-is for that deployment; no TLS config belongs in
+the container.
+
+**Microphone requires a secure context.** Browsers only allow mic capture over
+`https://` or on `localhost`, so using the dashboard's mic *from another machine*
+needs HTTPS. For one-off local demos, set the runtime env var `ENABLE_TLS=1` and
+the container generates a self-signed cert at startup (written to tmpfs — nothing
+is baked into the image):
+
+```bash
+# One-off demo with HTTPS + microphone over the LAN
+docker run -d --name parakeet-demo \
+  --gpus '"device=<uuid-or-index>"' \
+  -e DEVICE=cuda -e ENABLE_TLS=1 \
+  --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
+  -p 8443:8000 parakeet-stt
+
+# or with compose:  ENABLE_TLS=1 docker compose up
+```
+
+Then open `https://<server-ip>:8443/` and accept the self-signed certificate
+warning once.
+
+| Mode | Set | Serves | Use for |
+|------|-----|--------|---------|
+| **HTTP** (default) | `ENABLE_TLS` unset | `http://…` | API access; production behind an ingress that does TLS |
+| **HTTPS** (opt-in) | `ENABLE_TLS=1` | `https://…` (self-signed) | One-off browser-mic demos over the LAN |
+
+In Kubernetes, leave `ENABLE_TLS` unset in the Deployment and let the ingress
+provide HTTPS. If an `API_KEY` is set, append it to the dashboard URL so the
+WebSocket can authenticate: `…/?api_key=<key>`.
+
 ## Benchmarking
 
 `benchmark_stt.py` is a realtime streaming concurrency benchmark for the STT service. It generates test audio via a TTS service, streams it over concurrent WebSocket connections at real-time pace, and measures EOS latency, word error rate (WER), GPU utilization, and VRAM usage as concurrency scales up.

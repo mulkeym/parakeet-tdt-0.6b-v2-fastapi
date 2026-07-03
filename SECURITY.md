@@ -49,6 +49,19 @@ evaluating the service for a restricted / air-gapped environment.
   server-side only.
 - The `/debug/cfg` model-configuration endpoint has been removed.
 
+### Demo dashboard (browser client)
+- Served **same-origin only**: self-hosted fonts, external CSS/JS, no CDN calls
+  (consistent with the air-gapped posture).
+- Strict **Content-Security-Policy** (`default-src 'self'`, no `unsafe-inline`)
+  plus `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer`, `Permissions-Policy` (mic self only), and
+  `Cross-Origin-Opener-Policy` on every response.
+- Transcript text (untrusted model output) is rendered via `textContent`; the UI
+  uses no `innerHTML` with dynamic data.
+- The dashboard can be disabled entirely with `SERVE_DASHBOARD=0` (returns 404).
+- Optional WebSocket `Origin` allowlist via `ALLOWED_WS_ORIGINS` guards against
+  cross-site WebSocket hijacking (auth is already token-based, not cookie-based).
+
 ## Deployment assumptions / operator responsibilities
 - **TLS termination** is expected at an upstream gateway / ingress. The service
   speaks plain HTTP/WS.
