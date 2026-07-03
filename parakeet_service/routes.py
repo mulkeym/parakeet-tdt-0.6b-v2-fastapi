@@ -6,12 +6,13 @@ from pathlib import Path
 from collections import defaultdict
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status, Request, Form
+from fastapi.responses import FileResponse
 
 from .audio import ensure_mono_16k, probe_duration, schedule_cleanup
 from .auth import require_api_key
 from .model import _to_builtin
 from .schemas import TranscriptionResponse
-from .config import MAX_AUDIO_DURATION, MAX_UPLOAD_BYTES, PROCESSING_TIMEOUT, logger
+from .config import MAX_AUDIO_DURATION, MAX_UPLOAD_BYTES, PROCESSING_TIMEOUT, SERVE_DASHBOARD, logger
 
 from parakeet_service.model import reset_fast_path
 from parakeet_service.chunker import vad_chunk_lowmem
@@ -39,6 +40,20 @@ async def _stream_to_file(file: UploadFile, dest: Path) -> None:
                     detail=f"Upload exceeds maximum allowed size of {MAX_UPLOAD_BYTES} bytes",
                 )
             f.write(chunk)
+
+
+_STATIC_DIR = Path(__file__).parent / "static"
+
+
+@router.get("/", include_in_schema=False)
+def dashboard():
+    """Serve the live-transcription demo dashboard (public, no auth).
+
+    Returns 404 when the dashboard is disabled (SERVE_DASHBOARD=0).
+    """
+    if not SERVE_DASHBOARD:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return FileResponse(_STATIC_DIR / "index.html")
 
 
 @router.get("/healthz", summary="Liveness/readiness probe")

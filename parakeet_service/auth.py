@@ -17,7 +17,7 @@ import hmac
 
 from fastapi import HTTPException, Request, WebSocket, status
 
-from .config import API_KEY, API_KEY_HEADER, logger
+from .config import ALLOWED_WS_ORIGINS, API_KEY, API_KEY_HEADER, logger
 
 
 def _extract_key(headers) -> str | None:
@@ -58,6 +58,15 @@ async def websocket_authorized(ws: WebSocket) -> bool:
     Query-parameter fallback (``?api_key=``) is supported because browser
     WebSocket clients cannot set custom headers.
     """
+    # Optional Origin allowlist (defense against cross-site WebSocket hijacking).
+    # Only enforced when configured and when the client sends an Origin header
+    # (browsers do; native/CLI clients typically do not).
+    if ALLOWED_WS_ORIGINS is not None:
+        origin = ws.headers.get("origin")
+        if origin is not None and origin not in ALLOWED_WS_ORIGINS:
+            logger.warning("Rejected WebSocket connection: disallowed Origin %r", origin)
+            return False
+
     if API_KEY is None:  # auth disabled
         return True
     presented = _extract_key(ws.headers) or ws.query_params.get("api_key")

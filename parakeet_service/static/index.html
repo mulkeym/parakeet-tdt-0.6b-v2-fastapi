@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Parakeet · Live Transcription</title>
+<link rel="stylesheet" href="/static/fonts.css" />
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+<div class="app" id="app">
+  <header>
+    <div class="brand">
+      <span class="eyebrow">On-device speech recognition</span>
+      <h1>Para<em>keet</em></h1>
+      <div class="sub">FastConformer&#8209;TDT · <b>0.6B</b> · streaming via WebSocket</div>
+    </div>
+    <div class="status" id="status" data-s="idle">
+      <span class="dot"></span><span class="txt">Standby</span>
+    </div>
+  </header>
+
+  <section class="stage" id="stage">
+    <div class="scope">
+      <div class="cline"></div>
+      <div class="tag">Input · 16 kHz mono</div>
+      <div class="lvl" id="lvl">-inf dB</div>
+      <canvas id="scope"></canvas>
+    </div>
+    <div class="transcript" id="transcript">
+      <div class="empty" id="empty">
+        <div class="big" id="emptyBig">“Press listen, then speak.”</div>
+        <div class="small" id="emptySmall">Words appear here in real time</div>
+      </div>
+      <div class="flow" id="flow"><span class="caret" id="caret"></span></div>
+    </div>
+  </section>
+
+  <section class="console">
+    <div class="mic">
+      <button class="mic-btn" id="micBtn" aria-label="Toggle listening">
+        <span class="ring"></span>
+        <svg id="micIcon" viewBox="0 0 24 24"><path d="M12 15a3.5 3.5 0 0 0 3.5-3.5v-5a3.5 3.5 0 1 0-7 0v5A3.5 3.5 0 0 0 12 15Zm6-3.5a6 6 0 0 1-12 0H4a8 8 0 0 0 7 7.94V22h2v-2.56A8 8 0 0 0 20 11.5h-2Z"/></svg>
+      </button>
+      <div class="mic-label">
+        <span class="k" id="micK">Listen</span>
+        <span class="h" id="micH">Tap or press Space</span>
+      </div>
+    </div>
+    <div class="meters">
+      <div class="m"><span class="k">Status</span><span class="v" id="mStatus">Standby</span></div>
+      <div class="m"><span class="k">Latency</span><span class="v amber"><span id="mLat">—</span><span class="u">ms</span></span></div>
+      <div class="m"><span class="k">Confidence</span><span class="v mint"><span id="mConf">—</span><span class="u">%</span></span></div>
+      <div class="m"><span class="k">Utterances</span><span class="v" id="mChunks">0</span></div>
+      <div class="m"><span class="k">Sample rate</span><span class="v"><span id="mSr">16</span><span class="u">kHz</span></span></div>
+    </div>
+  </section>
+</div>
+
+<div class="banner" id="banner">
+  <button class="x" id="bannerX" aria-label="Dismiss">✕</button>
+  <div class="t" id="bannerT">Microphone unavailable</div>
+  <div class="d" id="bannerD"></div>
+</div>
+
+<script src="/static/app.js" defer></script>
+</body>
+</html>

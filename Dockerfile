@@ -103,17 +103,21 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# Copy the virtualenv, pre-baked model caches, and application code, all owned
-# by the unprivileged runtime user.
+# Copy the virtualenv, pre-baked model caches, application code, and the
+# entrypoint/healthcheck helpers, all owned by the unprivileged runtime user.
 COPY --from=builder --chown=appuser:appuser /opt/venv /opt/venv
 COPY --from=builder --chown=appuser:appuser /opt/models /opt/models
 COPY --chown=appuser:appuser parakeet_service ./parakeet_service
+COPY --chown=appuser:appuser --chmod=0755 scripts/entrypoint.sh /app/entrypoint.sh
+COPY --chown=appuser:appuser scripts/healthcheck.py /app/healthcheck.py
 
 USER appuser
 
 EXPOSE 8000
 
+# Set ENABLE_TLS=1 at runtime to serve HTTPS with a self-signed cert (needed for
+# browser microphone access over the LAN). Defaults to plain HTTP.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"
+    CMD ["python", "/app/healthcheck.py"]
 
-CMD ["uvicorn", "parakeet_service.main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["/app/entrypoint.sh"]
